@@ -2,7 +2,7 @@
   "name": "SKLOta",
   "version": "1.0.0",
   "description": "Signed, rollback-safe OTA firmware updates for ESP32: ECDSA P-256 signed manifests, SHA-256 checked downloads into the other app slot, newer-builds-only, and automatic rollback when a new build fails its self-test.",
-  "keywords": "ota, firmware, update, signed, ecdsa, rollback, esp32",
+  "keywords": "ota, firmware, update, signed, ecdsa, rollback, compressed, esp32",
   "authors": [
     { "name": "Martin Abbott", "email": "mabbott2011@gmail.com", "maintainer": true }
   ],

@@ -57,6 +57,8 @@ struct SKLOtaRelease {
   uint32_t size = 0;
   char version[24] = "";   // free text, e.g. a git commit
   char url[224] = "";      // absolute URL of the .bin
+  char zurl[224] = "";     // absolute URL of the zlib-compressed .bin, "" = none offered
+  uint32_t zsize = 0;      // its size in bytes
   char sha256[65] = "";    // lowercase hex
   char sig[160] = "";      // hex DER ECDSA signature
 };
@@ -78,6 +80,9 @@ struct SKLOtaConfig {
   uint32_t selfTestMinUptimeMs = 60UL * 1000;       // a new build must stay up this long...
   uint32_t selfTestTimeoutMs = 10UL * 60 * 1000;    // ...and pass its self-test within this
   uint32_t taskStack = 12288;                       // bytes, for the check/install task
+  // Download the compressed image when the manifest offers one (about a
+  // third smaller). Costs ~44 KB of heap during the install, no flash.
+  bool allowCompressed = true;
 };
 
 class SKLOta {
@@ -145,6 +150,8 @@ class SKLOta {
   static void taskEntry(void* arg);
   void doCheck();
   void doInstall();
+  bool download(const char* url, uint32_t expectBytes, bool compressed, uint32_t& got, const char*& failWhy,
+                void* hashCtx, char* msg, size_t msgLen);
   void fail(const char* why);
   void selfTestLoop();
   bool fetchManifest(SKLOtaRelease& m, bool& nonePublished, char* why, size_t whyLen);

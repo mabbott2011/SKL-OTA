@@ -3,6 +3,7 @@
 //
 // SKL-OTA -- see SKLOta.h for how an update flows.
 #include "SKLOta.h"
+#include "SKLOtaInflate.h"
 
 #include <ArduinoJson.h>
 #include <Preferences.h>
@@ -191,6 +192,19 @@ bool SKLOta::fetchManifest(SKLOtaRelease& m, bool& nonePublished, char* why, siz
   for (char* c = m.sha256; *c; c++) *c = tolower(*c);
   snprintf(m.sig, sizeof(m.sig), "%s", sig);
   snprintf(m.version, sizeof(m.version), "%s", ver);
+
+  // Optional zlib-compressed copy of the same image. Not signed itself: what
+  // it inflates to must still match the signed size and SHA-256.
+  m.zurl[0] = '\0';
+  m.zsize = 0;
+  const char* comp = doc["compression"] | "";
+  const char* zurl = doc["compressed_url"] | "";
+  uint32_t zsize = doc["compressed_size"] | 0UL;
+  if (strcmp(comp, "zlib") == 0 && zurl[0] && zsize) {
+    resolveUrl(url, zurl, m.zurl, sizeof(m.zurl));
+    if (strncasecmp(m.zurl, "http", 4) == 0) m.zsize = zsize;
+    else m.zurl[0] = '\0';
+  }
   return true;
 }
 
@@ -286,63 +300,69 @@ void SKLOta::fail(const char* why) {
   setMessage(SKLOtaState::Failed, why);
 }
 
-void SKLOta::doInstall() {
-  if (state_ != SKLOtaState::Available) {
-    doCheck();
-    if (state_ != SKLOtaState::Available) return;
-  }
-  const SKLOtaRelease& m = offer_;
-  char msg[160];
-  snprintf(msg, sizeof(msg), "Installing build %lu from %s", (unsigned long)m.build, m.url);
-  postLog(3, msg);
-  progress_ = 0;
-  setMessage(SKLOtaState::Installing, "Downloading...");
-
+// Streams one URL into the update slot, hashing the image as it's written.
+// compressed: the body is a zlib stream that inflates to the image.
+bool SKLOta::download(const char* url, uint32_t expectBytes, bool compressed, uint32_t& got,
+                      const char*& failWhy, void* hashCtx, char* msg, size_t msgLen) {
+  mbedtls_md_context_t* ctx = (mbedtls_md_context_t*)hashCtx;
+  const uint32_t imageSize = offer_.size;
+  got = 0;
   HTTPClient http;
   http.setTimeout(15000);
   http.setFollowRedirects(HTTPC_FORCE_FOLLOW_REDIRECTS);  // e.g. GitHub release assets
-  if (!http.begin(m.url)) { fail("Bad download URL"); return; }
-  if (requestFn_) requestFn_(http, m.url);
+  if (!http.begin(url)) { failWhy = "Bad download URL"; return false; }
+  if (requestFn_) requestFn_(http, url);
   int code = http.GET();
   if (code != 200) {
     http.end();
-    snprintf(msg, sizeof(msg), "Download error (HTTP %d)", code);
-    fail(msg);
-    return;
+    snprintf(msg, msgLen, "Download error (HTTP %d)", code);
+    failWhy = msg;
+    return false;
   }
   int len = http.getSize();
-  if (len > 0 && (uint32_t)len != m.size) { http.end(); fail("Download size mismatch"); return; }
-  if (!Update.begin(m.size, U_FLASH)) {
-    http.end();
-    snprintf(msg, sizeof(msg), "Can't start update: %s", Update.errorString());
-    fail(msg);
-    return;
-  }
+  if (len > 0 && (uint32_t)len != expectBytes) { http.end(); failWhy = "Download size mismatch"; return false; }
 
+  // Every image byte, compressed download or not, goes through here.
+  auto sink = [&](const uint8_t* data, size_t n) -> bool {
+    if (got + n > imageSize) { failWhy = "Image larger than signed"; return false; }
+    mbedtls_md_update(ctx, data, n);
+    if (Update.write((uint8_t*)data, n) != n) { failWhy = "Flash write failed"; return false; }
+    got += n;
+    int pct = (int)((uint64_t)got * 100 / imageSize);
+    if (pct != progress_) {
+      progress_ = pct;
+      if (changeFn_) changeFn_();
+    }
+    return true;
+  };
+
+  SKLOtaInflater inflater;
+  if (compressed && !inflater.begin()) { http.end(); failWhy = "Out of memory"; return false; }
   const size_t BUF = 2048;
   uint8_t* buf = (uint8_t*)malloc(BUF);
-  mbedtls_md_context_t ctx;
-  mbedtls_md_init(&ctx);
-  bool ok = buf && mbedtls_md_setup(&ctx, mbedtls_md_info_from_type(MBEDTLS_MD_SHA256), 0) == 0 &&
-            mbedtls_md_starts(&ctx) == 0;
+  if (!buf) { http.end(); failWhy = "Out of memory"; return false; }
   WiFiClient* stream = http.getStreamPtr();
-  uint32_t got = 0;
+  uint32_t received = 0;
   unsigned long lastData = millis();
-  const char* failWhy = ok ? nullptr : "Out of memory";
-  while (ok && got < m.size) {
+  bool ok = true, finished = false;
+  while (ok && received < expectBytes) {
     size_t avail = stream->available();
     if (avail) {
-      size_t want = min(min(avail, BUF), (size_t)(m.size - got));
+      size_t want = min(min(avail, BUF), (size_t)(expectBytes - received));
       int n = stream->readBytes(buf, want);
       if (n <= 0) continue;
-      mbedtls_md_update(&ctx, buf, n);
-      if (Update.write(buf, n) != (size_t)n) { failWhy = "Flash write failed"; ok = false; break; }
-      got += n;
+      received += n;
       lastData = millis();
-      int pct = (int)((uint64_t)got * 100 / m.size);
-      if (pct != progress_) {
-        progress_ = pct;
-        if (changeFn_) changeFn_();
+      if (compressed) {
+        SKLOtaInflater::Result r = inflater.feed(buf, n, received == expectBytes, sink);
+        if (r == SKLOtaInflater::FAILED) {
+          if (!failWhy) failWhy = "Compressed image corrupt";
+          ok = false;
+        } else if (r == SKLOtaInflater::DONE) {
+          finished = true;
+        }
+      } else {
+        ok = sink(buf, n);
       }
     } else {
       if (!http.connected()) { failWhy = "Connection dropped"; ok = false; break; }
@@ -351,10 +371,56 @@ void SKLOta::doInstall() {
     }
   }
   http.end();
+  free(buf);
+  inflater.end();
+  if (ok && compressed && !finished) { failWhy = "Compressed image incomplete"; ok = false; }
+  return ok;
+}
+
+void SKLOta::doInstall() {
+  if (state_ != SKLOtaState::Available) {
+    doCheck();
+    if (state_ != SKLOtaState::Available) return;
+  }
+  const SKLOtaRelease& m = offer_;
+  bool compressed = cfg_.allowCompressed && m.zurl[0] && m.zsize;
+  char msg[200];
+  snprintf(msg, sizeof(msg), "Installing build %lu from %s%s", (unsigned long)m.build,
+           compressed ? m.zurl : m.url, compressed ? " (compressed)" : "");
+  postLog(3, msg);
+  progress_ = 0;
+  setMessage(SKLOtaState::Installing, "Downloading...");
+
+  if (!Update.begin(m.size, U_FLASH)) {
+    snprintf(msg, sizeof(msg), "Can't start update: %s", Update.errorString());
+    fail(msg);
+    return;
+  }
+  mbedtls_md_context_t ctx;
+  mbedtls_md_init(&ctx);
+  if (mbedtls_md_setup(&ctx, mbedtls_md_info_from_type(MBEDTLS_MD_SHA256), 0) != 0 || mbedtls_md_starts(&ctx) != 0) {
+    mbedtls_md_free(&ctx);
+    Update.abort();
+    fail("Out of memory");
+    return;
+  }
+  uint32_t got = 0;
+  const char* failWhy = nullptr;
+  char why[48];
+  bool ok = download(compressed ? m.zurl : m.url, compressed ? m.zsize : m.size, compressed, got, failWhy, &ctx,
+                     why, sizeof(why));
+  if (!ok && compressed && got == 0) {
+    // Nothing written yet (e.g. the compressed file isn't there): fall back
+    // to the plain image rather than fail the update.
+    snprintf(msg, sizeof(msg), "Compressed download failed (%s) -- trying the uncompressed image", failWhy ? failWhy : "?");
+    postLog(2, msg);
+    mbedtls_md_starts(&ctx);
+    failWhy = nullptr;
+    ok = download(m.url, m.size, false, got, failWhy, &ctx, why, sizeof(why));
+  }
   uint8_t hash[32];
   bool hashed = ok && mbedtls_md_finish(&ctx, hash) == 0;
   mbedtls_md_free(&ctx);
-  free(buf);
 
   if (!ok || !hashed || got != m.size) {
     Update.abort();

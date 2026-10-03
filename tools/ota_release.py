@@ -15,8 +15,9 @@ it is not a PlatformIO build script. Needs:  pip install cryptography
   sign     After building, sign the firmware:
              python ota_release.py sign --board my-board --build 143 \\
                  --bin .pio/build/esp32dev/firmware.bin --url-base https://example.com/fw
-           Writes releases/<build>/firmware-<build>.bin + manifest.json.
-           Host both so the manifest is what your manifest URL returns and the
+           Writes releases/<build>/firmware-<build>.bin, a zlib-compressed copy
+           (firmware-<build>.bin.zz, about a third smaller) and manifest.json.
+           Host all three so the manifest is what your manifest URL returns and the
            .bin is at the manifest's "url" (a "/path" is relative to the
            manifest's host).
 
@@ -32,6 +33,7 @@ import json
 import os
 import re
 import shutil
+import zlib
 import stat
 import sys
 
@@ -164,11 +166,22 @@ def cmd_sign(args):
     url = args.url if args.url else args.url_base.rstrip("/") + "/" + fname
     manifest = {"board": args.board, "build": build, "version": version, "url": url,
                 "size": len(data), "sha256": sha, "sig": sig}
+    zinfo = ""
+    if not args.no_compress:
+        z = zlib.compress(data, 9)
+        if len(z) < len(data):
+            with open(os.path.join(out, fname + ".zz"), "wb") as f:
+                f.write(z)
+            manifest.update({"compression": "zlib", "compressed_url": url + ".zz", "compressed_size": len(z)})
+            zinfo = "  {0}  ({1} bytes, {2:.0f}% smaller)".format(os.path.join(out, fname + ".zz"), len(z),
+                                                                 100 - len(z) * 100.0 / len(data))
     with open(os.path.join(out, "manifest.json"), "w") as f:
         json.dump(manifest, f, indent=2)
         f.write("\n")
     print("Signed build {0} ({1}), {2} bytes, context '{3}'".format(build, version or "no version", len(data), args.context))
     print("  {0}".format(os.path.join(out, fname)))
+    if zinfo:
+        print(zinfo)
     print("  {0}  (url: {1})".format(os.path.join(out, "manifest.json"), url))
 
 
@@ -183,6 +196,18 @@ def cmd_verify(args):
     sha = hashlib.sha256(data).hexdigest()
     if sha != manifest["sha256"].lower():
         print("FAIL sha256 mismatch"); ok = False
+    if manifest.get("compression") == "zlib":
+        zpath = os.path.join(os.path.dirname(binpath), os.path.basename(manifest["compressed_url"]))
+        try:
+            z = open(zpath, "rb").read()
+            if len(z) != manifest["compressed_size"]:
+                print("FAIL compressed size: file {0}, manifest {1}".format(len(z), manifest["compressed_size"])); ok = False
+            elif zlib.decompress(z) != data:
+                print("FAIL compressed copy doesn't inflate to the image"); ok = False
+            else:
+                print("compressed copy OK ({0} bytes)".format(len(z)))
+        except (OSError, zlib.error) as e:
+            print("FAIL compressed copy: {0}".format(e)); ok = False
     pem = header_pubkey_pem(args.header)
     if not pem:
         sys.exit("No public key in {0}".format(args.header))
@@ -223,6 +248,7 @@ def main():
     g.add_argument("--url", help="exact URL of the .bin (or /path relative to the manifest's host)")
     s.add_argument("--out", default="releases", help="output folder (default %(default)s)")
     s.add_argument("--allow-dirty", action="store_true", help="sign a '-dirty' version (testing only)")
+    s.add_argument("--no-compress", action="store_true", help="don't write the zlib-compressed copy (.bin.zz)")
 
     v = sub.add_parser("verify", help="check a release like the device will")
     v.add_argument("manifest")

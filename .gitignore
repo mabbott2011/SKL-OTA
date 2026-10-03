@@ -5,3 +5,4 @@ examples/*/ota_pubkey.h
 releases/
 .pio/
 tools/__pycache__/
+test/host/build/

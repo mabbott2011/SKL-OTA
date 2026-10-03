@@ -10,4 +10,6 @@ First release, moved out of the Gnode firmware where it shipped on 2026-10-02.
 - Bootloader rollback: a new build must pass your `onSelfTest()` within `selfTestTimeoutMs`, or it's rolled back. The result survives reboots (`lastResult()`).
 - Checks and installs run in their own task; log lines are delivered on `loop()`.
 - Automatic checks (5 min after boot, then every 12 h); installs only on request.
-- `tools/ota_release.py`: `keygen`, `sign`, `verify`.
+- Compressed downloads: an optional zlib copy of the image (`compressed_url`), inflated as it arrives with the ESP32's ROM decompressor. It must still match the signed size and SHA-256. Falls back to the plain image if the compressed download fails before anything is written.
+- `tools/ota_release.py`: `keygen`, `sign` (writes the compressed copy too; `--no-compress` to skip), `verify`.
+- Host tests for the streaming decompressor (`test/host`).
