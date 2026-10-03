@@ -21,6 +21,9 @@ it is not a PlatformIO build script. Needs:  pip install cryptography
            .bin is at the manifest's "url" (a "/path" is relative to the
            manifest's host).
 
+           Add --fs-bin <image> to ship a filesystem image (SPIFFS / LittleFS)
+           with the build; it's signed separately, as "<context>-fs|...".
+
   verify   Check a release against include/ota_pubkey.h, as the device will:
              python ota_release.py verify releases/143/manifest.json --context skl-ota
 
@@ -51,6 +54,55 @@ DEFAULT_CONTEXT = "skl-ota"
 
 def signed_message(context, board, build, size, sha256_hex):
     return "{0}|{1}|{2}|{3}|{4}".format(context, board, build, size, sha256_hex).encode("ascii")
+
+
+def publish_image(out, fname, data, url, compress):
+    """Copy an image into the release folder (plus its zlib copy). Returns the
+    manifest fields for the copies and the lines to print."""
+    with open(os.path.join(out, fname), "wb") as f:
+        f.write(data)
+    fields = {"url": url}
+    lines = ["  {0}".format(os.path.join(out, fname))]
+    if compress:
+        z = zlib.compress(data, 9)
+        if len(z) < len(data):
+            with open(os.path.join(out, fname + ".zz"), "wb") as f:
+                f.write(z)
+            fields.update({"compression": "zlib", "compressed_url": url + ".zz", "compressed_size": len(z)})
+            lines.append("  {0}  ({1} bytes, {2:.0f}% smaller)".format(
+                os.path.join(out, fname + ".zz"), len(z), 100 - len(z) * 100.0 / len(data)))
+    return fields, lines
+
+
+def check_image(label, folder, entry, data_name, context, board, build, pub):
+    """verify: one image (app or filesystem) against its manifest entry."""
+    ok = True
+    path = os.path.join(folder, os.path.basename(entry["url"])) if data_name is None else data_name
+    data = open(path, "rb").read()
+    if len(data) != entry["size"]:
+        print("FAIL {0} size: file {1}, manifest {2}".format(label, len(data), entry["size"])); ok = False
+    if hashlib.sha256(data).hexdigest() != entry["sha256"].lower():
+        print("FAIL {0} sha256 mismatch".format(label)); ok = False
+    if entry.get("compression") == "zlib":
+        zpath = os.path.join(folder, os.path.basename(entry["compressed_url"]))
+        try:
+            z = open(zpath, "rb").read()
+            if len(z) != entry["compressed_size"]:
+                print("FAIL {0} compressed size: file {1}, manifest {2}".format(label, len(z), entry["compressed_size"])); ok = False
+            elif zlib.decompress(z) != data:
+                print("FAIL {0} compressed copy doesn't inflate to the image".format(label)); ok = False
+            else:
+                print("{0} compressed copy OK ({1} bytes)".format(label, len(z)))
+        except (OSError, zlib.error) as e:
+            print("FAIL {0} compressed copy: {1}".format(label, e)); ok = False
+    try:
+        pub.verify(bytes.fromhex(entry["sig"]),
+                   signed_message(context, board, build, entry["size"], entry["sha256"].lower()),
+                   ec.ECDSA(hashes.SHA256()))
+        print("{0} signature OK".format(label))
+    except InvalidSignature:
+        print("FAIL {0} signature (wrong key, or wrong --context?)".format(label)); ok = False
+    return ok
 
 
 def read_define(path, name):
@@ -111,7 +163,8 @@ def cmd_keygen(args):
         sys.exit("Refusing to overwrite the existing key at {0}.\n"
                  "Devices already trust it -- a new key would lock them out of updates.\n"
                  "(--header-only re-writes the public header from it.)".format(args.key))
-    os.makedirs(os.path.dirname(args.key), exist_ok=True)
+    if os.path.dirname(args.key):
+        os.makedirs(os.path.dirname(args.key), exist_ok=True)
     key = ec.generate_private_key(ec.SECP256R1())
     with open(args.key, "wb") as f:
         f.write(key.private_bytes(serialization.Encoding.PEM,
@@ -155,71 +208,53 @@ def cmd_sign(args):
         sys.exit("{0} doesn't match {1} -- devices running this build couldn't verify the NEXT update. "
                  "Fix the key/header before releasing.".format(args.header, args.key))
 
-    sha = hashlib.sha256(data).hexdigest()
-    sig = key.sign(signed_message(args.context, args.board, build, len(data), sha),
-                   ec.ECDSA(hashes.SHA256())).hex()
+    fsdata = None
+    if args.fs_bin:
+        fsdata = open(args.fs_bin, "rb").read()
+        if args.fs_size and len(fsdata) > args.fs_size:
+            sys.exit("filesystem image is {0} bytes; the partition holds {1}".format(len(fsdata), args.fs_size))
+
+    def sign(ctx, blob):
+        sha = hashlib.sha256(blob).hexdigest()
+        return sha, key.sign(signed_message(ctx, args.board, build, len(blob), sha), ec.ECDSA(hashes.SHA256())).hex()
 
     out = os.path.join(args.out, str(build))
     os.makedirs(out, exist_ok=True)
     fname = "firmware-{0}.bin".format(build)
-    shutil.copyfile(args.bin, os.path.join(out, fname))
     url = args.url if args.url else args.url_base.rstrip("/") + "/" + fname
-    manifest = {"board": args.board, "build": build, "version": version, "url": url,
-                "size": len(data), "sha256": sha, "sig": sig}
-    zinfo = ""
-    if not args.no_compress:
-        z = zlib.compress(data, 9)
-        if len(z) < len(data):
-            with open(os.path.join(out, fname + ".zz"), "wb") as f:
-                f.write(z)
-            manifest.update({"compression": "zlib", "compressed_url": url + ".zz", "compressed_size": len(z)})
-            zinfo = "  {0}  ({1} bytes, {2:.0f}% smaller)".format(os.path.join(out, fname + ".zz"), len(z),
-                                                                 100 - len(z) * 100.0 / len(data))
+    base = args.url_base.rstrip("/") if args.url_base else url.rsplit("/", 1)[0]
+    sha, sig = sign(args.context, data)
+    fields, lines = publish_image(out, fname, data, url, not args.no_compress)
+    manifest = {"board": args.board, "build": build, "version": version, "size": len(data), "sha256": sha, "sig": sig}
+    manifest.update(fields)
+    if fsdata is not None:
+        fsname = "filesystem-{0}.bin".format(build)
+        fsha, fsig = sign(args.context + "-fs", fsdata)
+        ffields, flines = publish_image(out, fsname, fsdata, base + "/" + fsname, not args.no_compress)
+        manifest["fs"] = dict({"size": len(fsdata), "sha256": fsha, "sig": fsig}, **ffields)
+        lines += flines
     with open(os.path.join(out, "manifest.json"), "w") as f:
         json.dump(manifest, f, indent=2)
         f.write("\n")
-    print("Signed build {0} ({1}), {2} bytes, context '{3}'".format(build, version or "no version", len(data), args.context))
-    print("  {0}".format(os.path.join(out, fname)))
-    if zinfo:
-        print(zinfo)
+    print("Signed build {0} ({1}), {2} bytes{3}, context '{4}'".format(
+        build, version or "no version", len(data),
+        " + {0}-byte filesystem image".format(len(fsdata)) if fsdata is not None else "", args.context))
+    for line in lines:
+        print(line)
     print("  {0}  (url: {1})".format(os.path.join(out, "manifest.json"), url))
 
 
 def cmd_verify(args):
     manifest = json.load(open(args.manifest))
-    binpath = args.bin or os.path.join(os.path.dirname(os.path.abspath(args.manifest)),
-                                       os.path.basename(manifest["url"]))
-    data = open(binpath, "rb").read()
-    ok = True
-    if len(data) != manifest["size"]:
-        print("FAIL size: file {0}, manifest {1}".format(len(data), manifest["size"])); ok = False
-    sha = hashlib.sha256(data).hexdigest()
-    if sha != manifest["sha256"].lower():
-        print("FAIL sha256 mismatch"); ok = False
-    if manifest.get("compression") == "zlib":
-        zpath = os.path.join(os.path.dirname(binpath), os.path.basename(manifest["compressed_url"]))
-        try:
-            z = open(zpath, "rb").read()
-            if len(z) != manifest["compressed_size"]:
-                print("FAIL compressed size: file {0}, manifest {1}".format(len(z), manifest["compressed_size"])); ok = False
-            elif zlib.decompress(z) != data:
-                print("FAIL compressed copy doesn't inflate to the image"); ok = False
-            else:
-                print("compressed copy OK ({0} bytes)".format(len(z)))
-        except (OSError, zlib.error) as e:
-            print("FAIL compressed copy: {0}".format(e)); ok = False
+    folder = os.path.dirname(os.path.abspath(args.manifest))
     pem = header_pubkey_pem(args.header)
     if not pem:
         sys.exit("No public key in {0}".format(args.header))
     pub = serialization.load_pem_public_key(pem.encode("ascii"))
-    try:
-        pub.verify(bytes.fromhex(manifest["sig"]),
-                   signed_message(args.context, manifest["board"], manifest["build"], manifest["size"],
-                                  manifest["sha256"].lower()),
-                   ec.ECDSA(hashes.SHA256()))
-        print("signature OK")
-    except InvalidSignature:
-        print("FAIL signature (wrong key, or wrong --context?)"); ok = False
+    ok = check_image("firmware", folder, manifest, args.bin, args.context, manifest["board"], manifest["build"], pub)
+    if "fs" in manifest:
+        ok = check_image("filesystem", folder, manifest["fs"], None, args.context + "-fs",
+                         manifest["board"], manifest["build"], pub) and ok
     print("PASS" if ok else "REJECTED -- a device would refuse this update")
     sys.exit(0 if ok else 1)
 
@@ -248,7 +283,9 @@ def main():
     g.add_argument("--url", help="exact URL of the .bin (or /path relative to the manifest's host)")
     s.add_argument("--out", default="releases", help="output folder (default %(default)s)")
     s.add_argument("--allow-dirty", action="store_true", help="sign a '-dirty' version (testing only)")
-    s.add_argument("--no-compress", action="store_true", help="don't write the zlib-compressed copy (.bin.zz)")
+    s.add_argument("--no-compress", action="store_true", help="don't write the zlib-compressed copies (.bin.zz)")
+    s.add_argument("--fs-bin", help="filesystem image for this build, e.g. .pio/build/<env>/littlefs.bin")
+    s.add_argument("--fs-size", type=lambda v: int(v, 0), help="refuse a filesystem image bigger than this partition")
 
     v = sub.add_parser("verify", help="check a release like the device will")
     v.add_argument("manifest")

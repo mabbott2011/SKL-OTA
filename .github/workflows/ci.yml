@@ -1,0 +1,78 @@
+# SKL-OTA CI (2026-10-03): the streaming decompressor's host tests, the
+# release tool end to end (incl. tampered releases being rejected), the
+# example sketch compiled for a real ESP32, and on a version tag, a check
+# that library.json / library.properties carry the same version.
+name: CI
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  schedule:
+    - cron: "29 13 * * 1"   # Mondays: catch an ArduinoJson / core update that breaks the build
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  host-tests:
+    name: Decompressor host tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Get miniz (same tinfl as the ESP32 ROM)
+        run: git clone --depth 1 -b 3.0.2 https://github.com/richgel999/miniz.git "$RUNNER_TEMP/miniz"
+      - name: Run
+        run: MINIZ_DIR="$RUNNER_TEMP/miniz" bash test/host/run.sh
+
+  release-tool:
+    name: ota_release.py
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install cryptography
+      - run: bash tools/test_ota_release.sh
+
+  example:
+    name: Example builds for ESP32
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - uses: actions/cache@v4
+        with:
+          path: ~/.platformio
+          key: pio-${{ runner.os }}-${{ hashFiles('library.json') }}
+          restore-keys: pio-${{ runner.os }}-
+      - run: pip install platformio
+      - name: Compile examples/Basic
+        run: pio ci examples/Basic/Basic.ino --lib . --board esp32dev -O "platform=espressif32@^6" -O "lib_deps=bblanchon/ArduinoJson@^7"
+
+  version:
+    name: Tag matches library version
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Compare
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          json=$(python3 -c "import json; print(json.load(open('library.json'))['version'])")
+          props=$(sed -n 's/^version=//p' library.properties)
+          hdr=$(sed -n 's/^#define SKL_OTA_VERSION "\(.*\)"/\1/p' src/SKLOta.h)
+          echo "tag $tag, library.json $json, library.properties $props, SKLOta.h $hdr"
+          [ "$tag" = "$json" ] && [ "$tag" = "$props" ] && [ "$tag" = "$hdr" ] || { echo "::error::version mismatch"; exit 1; }

@@ -27,6 +27,10 @@ const char* WIFI_SSID = "your-ssid";
 const char* WIFI_PASS = "your-password";
 
 void setup() {
+  // First thing: if this is a new build on probation, start the rollback
+  // deadline before anything that could hang. Does nothing otherwise.
+  Ota.armRollbackGuard();
+
   Serial.begin(115200);
   WiFi.begin(WIFI_SSID, WIFI_PASS);
 
@@ -41,6 +45,12 @@ void setup() {
     status = ok ? "wifi ok" : "no wifi";
     return ok;
   });
+
+  // If your release also ships a LittleFS image (sign --fs-bin), let
+  // SKL-OTA unmount it while it's rewritten:
+  //   Ota.onFilesystemUpdate([](bool starting, bool ok) {
+  //     if (starting) LittleFS.end(); else if (ok) ESP.restart(); else LittleFS.begin(true);
+  //   });
 
   SKLOtaConfig cfg;
   cfg.publicKeyPem = OTA_PUBKEY_PEM;

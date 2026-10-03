@@ -24,7 +24,17 @@
 //   4. PROVE   The new firmware boots "pending verify". It marks itself good
 //              only after your self-test passes. A crash or reset before
 //              that, or no pass within selfTestTimeoutMs, and the bootloader
-//              goes back to the previous build by itself.
+//              goes back to the previous build by itself. The deadline is
+//              enforced by a timer, not by loop(), so a build that hangs
+//              (stuck in a driver, never resetting) is rolled back too --
+//              see armRollbackGuard().
+//   5. FILES   (optional) A release can carry a filesystem image (SPIFFS /
+//              LittleFS / FAT) made for that build, signed separately over
+//                "<context>-fs|<board>|<build>|<size>|<sha256>"
+//              It's written only after the build has passed step 4, so a
+//              build that rolls back never touches the filesystem. The
+//              filesystem has no second copy: an interrupted write is
+//              retried automatically (the firmware itself keeps running).
 //
 // Checks and installs run in their own FreeRTOS task (TLS + ECDSA need far
 // more stack than loop() has spare). Log messages from that task are handed
@@ -38,9 +48,10 @@
 
 #include <Arduino.h>
 #include <HTTPClient.h>
+#include <esp_timer.h>
 #include <functional>
 
-#define SKL_OTA_VERSION "1.0.0"
+#define SKL_OTA_VERSION "1.1.0"
 
 enum class SKLOtaState : uint8_t {
   Idle,        // nothing happening (or never checked)
@@ -51,7 +62,17 @@ enum class SKLOtaState : uint8_t {
   Failed       // last check or install failed -- see message()
 };
 
-// A release the device has fetched and verified the signature of.
+// A filesystem image that comes with a release.
+struct SKLOtaImage {
+  uint32_t size = 0;       // 0 = the release has no filesystem image
+  char sha256[65] = "";
+  char sig[160] = "";      // over "<context>-fs|<board>|<build>|<size>|<sha256>"
+  char url[224] = "";
+  char zurl[224] = "";     // zlib-compressed copy, "" = none
+  uint32_t zsize = 0;
+};
+
+// A release the device has fetched and verified the signature(s) of.
 struct SKLOtaRelease {
   uint32_t build = 0;
   uint32_t size = 0;
@@ -61,6 +82,7 @@ struct SKLOtaRelease {
   uint32_t zsize = 0;      // its size in bytes
   char sha256[65] = "";    // lowercase hex
   char sig[160] = "";      // hex DER ECDSA signature
+  SKLOtaImage fs;          // optional filesystem image for this build
 };
 
 struct SKLOtaConfig {
@@ -83,6 +105,10 @@ struct SKLOtaConfig {
   // Download the compressed image when the manifest offers one (about a
   // third smaller). Costs ~44 KB of heap during the install, no flash.
   bool allowCompressed = true;
+  // Install a release's filesystem image (after the new build passes its
+  // self-test). Also needs onFilesystemUpdate() so your code can unmount
+  // the filesystem while it's rewritten.
+  bool updateFilesystem = true;
 };
 
 class SKLOta {
@@ -94,6 +120,7 @@ class SKLOta {
   using BoolFn = std::function<bool()>;
   using VoidFn = std::function<void()>;
   using RollbackFn = std::function<void(const char* why)>;
+  using FilesystemFn = std::function<void(bool starting, bool ok)>;
 
   // --- setup ---------------------------------------------------------------
   // Where the manifest is. A function is re-evaluated at every check, so a
@@ -123,6 +150,22 @@ class SKLOta {
   // The self-test failed and the device is about to reboot into the
   // previous build (e.g. save state, show a message). Runs on loop().
   void onRollback(RollbackFn fn);
+  // A filesystem image is about to be written (starting = true): unmount
+  // the filesystem and stop serving files from it. Then again when it's
+  // done (starting = false, ok = whether it worked): mount it again, or
+  // restart. Both calls run on loop(). Without this hook, filesystem images
+  // are skipped (writing under a mounted filesystem would corrupt it).
+  void onFilesystemUpdate(FilesystemFn fn);
+
+  // Optional, but recommended as the FIRST line of setup(): if this boot is
+  // a new build still waiting on its self-test, start the rollback deadline
+  // now, before any code that could hang (sensor drivers, I2C, WiFi). When
+  // it runs out, a timer restarts the device and the bootloader goes back to
+  // the previous build -- even if loop() never runs again. begin() starts
+  // the same guard, but only from wherever begin() is called. Pass the same
+  // value as SKLOtaConfig.selfTestTimeoutMs. Safe to call on every boot:
+  // does nothing (returns false) unless a new build is pending.
+  bool armRollbackGuard(uint32_t selfTestTimeoutMs = 10UL * 60 * 1000);
 
   // Call once from setup(), after your logger is ready. Returns false when
   // the config is incomplete (updates then always fail with a message).
@@ -145,17 +188,27 @@ class SKLOta {
   const SKLOtaRelease& offer() const { return offer_; }  // valid when state() == Available
   const char* lastResult() const { return lastResult_; } // outcome of the last install, survives reboots
   uint32_t build() const { return cfg_.build; }
+  // This build's filesystem image is still to be written (waiting for the
+  // self-test, a network, or a retry after a failed/interrupted write).
+  bool filesystemPending() const { return fsPending_; }
 
  private:
   static void taskEntry(void* arg);
   void doCheck();
   void doInstall();
-  bool download(const char* url, uint32_t expectBytes, bool compressed, uint32_t& got, const char*& failWhy,
-                void* hashCtx, char* msg, size_t msgLen);
+  void doFilesystemInstall();
+  bool download(const char* url, uint32_t expectBytes, bool compressed, uint32_t imageSize, uint32_t& got,
+                const char*& failWhy, void* hashCtx, char* msg, size_t msgLen);
+  bool writeImage(int command, uint32_t size, const char* url, const char* zurl, uint32_t zsize,
+                  const char* sha256, const char*& failWhy, char* why, size_t whyLen);
+  void rememberFilesystem(const SKLOtaRelease& m);
+  void clearFilesystemRecord();
   void fail(const char* why);
   void selfTestLoop();
+  void disarmRollbackGuard();
   bool fetchManifest(SKLOtaRelease& m, bool& nonePublished, char* why, size_t whyLen);
-  bool verifySignature(const SKLOtaRelease& m, char* why, size_t whyLen);
+  bool verifySignature(const char* contextSuffix, uint32_t build, uint32_t size, const char* sha256,
+                       const char* sigHex, char* why, size_t whyLen);
   void setMessage(SKLOtaState st, const char* msg);
   void saveResult(const char* msg);
   void clearInstallRecord();
@@ -173,16 +226,23 @@ class SKLOta {
   VoidFn changeFn_;
   VoidFn restartFn_;
   RollbackFn rollbackFn_;
+  FilesystemFn filesystemFn_;
 
   volatile SKLOtaState state_ = SKLOtaState::Idle;
   volatile int progress_ = -1;
   volatile bool busy_ = false;
-  volatile uint8_t request_ = 0;  // 1 = check, 2 = check + install
+  volatile uint8_t request_ = 0;  // 1 = check, 2 = check + install (3 = filesystem, internal)
   bool pendingVerify_ = false;
   bool reportPending_ = false;
+  esp_timer_handle_t guardTimer_ = nullptr;  // see armRollbackGuard()
   unsigned long lastCheckMs_ = 0;
+  bool fsPending_ = false;
+  bool fsRunning_ = false;
+  volatile bool fsOk_ = false;
+  bool fsHookWarned_ = false;
+  uint8_t fsAttempts_ = 0;
+  unsigned long fsNextTryMs_ = 0;
   SKLOtaRelease offer_;
-  SKLOtaRelease scratch_;
   char message_[64] = "";
   char lastResult_[64] = "";
   char logText_[160] = "";

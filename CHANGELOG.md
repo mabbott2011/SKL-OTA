@@ -1,5 +1,16 @@
 # Changelog
 
+## 1.1.0 (2026-10-03)
+
+- Filesystem images (SPIFFS / LittleFS / FAT) shipped with a release: an optional `"fs"` block in the manifest, signed separately over `<context>-fs|<board>|<build>|<size>|<sha256>`.
+- Written only after the new build passes its self-test, so a rolled-back build never touches the filesystem. Interrupted or failed writes are retried automatically (1, 2, 4… min, at most hourly). An unchanged image (same SHA-256) isn't rewritten.
+- New: `onFilesystemUpdate()`, `filesystemPending()`, `SKLOtaConfig.updateFilesystem`, `SKLOtaRelease.fs`.
+- A release whose filesystem image fails its signature or doesn't fit the partition isn't installed.
+- The "report soon" flag survives restarts, so a server hears about an install even when the device restarts right after it.
+- `ota_release.py sign --fs-bin` (and `verify` checks the filesystem image).
+- Fix: a new build that **hangs** (stuck in `loop()` or `setup()` without resetting) is now rolled back. The self-test deadline used to be checked only inside `loop()`, and the Arduino loop watchdog is off by default, so a hung build stayed installed. An `esp_timer` now restarts the device 30 s after `selfTestTimeoutMs` if the build hasn't passed; a restart while pending makes the bootloader go back.
+- New: `armRollbackGuard()`. Call it first in `setup()` so hangs during startup are covered; `begin()` arms the same timer otherwise.
+
 ## 1.0.0 (2026-10-03)
 
 First release, moved out of the Gnode firmware where it shipped on 2026-10-02.

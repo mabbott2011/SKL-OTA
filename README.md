@@ -1,5 +1,7 @@
 # SKL-OTA
 
+[![CI](https://github.com/mabbott2011/SKL-OTA/actions/workflows/ci.yml/badge.svg)](https://github.com/mabbott2011/SKL-OTA/actions/workflows/ci.yml)
+
 Signed, rollback-safe OTA updates for ESP32. The board, build number and image hash are signed together, so devices refuse old, foreign or tampered builds, and roll back if a new build fails its self-test.
 
 Built by [Shady Knoll Labs](https://shadyknolllabs.com) for the Gnode plant sensor, and usable in any Arduino-ESP32 project.
@@ -24,8 +26,9 @@ The device installs only firmware you signed with a key that never leaves your c
 - **Signed releases only.** Each release's manifest carries an ECDSA P-256 signature over its board, build number, size and SHA-256. The device checks it against the public key compiled into the firmware. Signing can't be turned off, so the server, the CDN, or anyone in between can't push code you didn't sign.
 - **Newer builds only.** A device refuses any build number at or below its own, so an old signed build with a known bug can't be replayed onto it.
 - **The running firmware is never touched.** The update streams into the other app slot and is hashed as it arrives. The device switches slots only if the SHA-256 matches the signed one. A dropped connection, a full slot or a corrupted file leaves the old firmware running.
-- **Automatic rollback.** The new build boots "pending" and must pass your self-test (sensors found, server reachable, whatever "working" means for your product) within 10 minutes. If it crashes, resets or fails first, the bootloader goes back to the previous build. The outcome is saved, so the device can report it.
+- **Automatic rollback.** The new build boots "pending" and must pass your self-test (sensors found, server reachable, whatever "working" means for your product) within 10 minutes. If it crashes, resets, hangs or fails first, the bootloader goes back to the previous build. The deadline runs on a timer, not in `loop()`, so a build stuck in a driver can't stop it. The outcome is saved, so the device can report it.
 - **Compressed downloads.** Each release also ships as a zlib-compressed copy, about a third smaller (a 1.34 MB Gnode image downloads as 859 KB). The device inflates it as it arrives, using the decompressor already in the ESP32's ROM, so it costs no flash. It still has to match the signed hash byte for byte. Devices that don't know about compression just download the plain image.
+- **Filesystem updates, tied to their build.** A release can carry a SPIFFS / LittleFS / FAT image (web pages, config templates) signed separately. It's written only after the new build passes its self-test, so pages and firmware never get out of step, and a build that rolls back never touches the filesystem. An interrupted write is retried automatically.
 - **Host it anywhere.** The manifest and `.bin` are plain files: your own server, GitHub releases, S3, a Raspberry Pi on your LAN. Security comes from the signature, not from where the files live.
 - **Doesn't block `loop()`.** Checks and installs run in their own task with the stack TLS and ECDSA need. Log lines come back through `loop()`, so your logger never runs on another task.
 - **Checks automatically, installs only when asked.** It checks 5 minutes after boot and every 12 hours after that (both configurable), but only installs when your code calls `requestInstall()`.
@@ -63,10 +66,13 @@ flowchart TD
     subgraph NEW["ESP32 — build N boots PENDING_VERIFY"]
         T{"onSelfTest() passes<br/>within the timeout?"}
         T -->|yes| K["Mark valid<br/>build N is permanent"]
+        K --> F{"Release has a<br/>filesystem image?"}
+        F -->|yes| FW["Unmount · write it<br/>(.bin.zz inflated, SHA-256 checked)<br/>remount or restart"]
         T -->|"no · crash · reset"| RB["Bootloader rolls back<br/>to build M in slot A"]
     end
     SW --> T
-    K --> REP["lastResult() = Updated to build N"]
+    F -->|no| REP["lastResult() = Updated to build N"]
+    FW --> REPF["lastResult() = Updated to build N + files"]
     RB --> REP2["lastResult() = Build N failed self-test; rolled back"]
 ```
 
@@ -78,18 +84,22 @@ Three gates stand between a file on a server and your device running it:
 2. **After download:** the `.bin` must hash to exactly the SHA-256 that was signed. Until it does, the running firmware is never touched.
 3. **After restart:** the new build has to prove it works. If it can't, the bootloader puts the old one back without anyone touching the device.
 
+A filesystem image goes through the same first two gates with its own signature, and is written only after the third.
+
 ## What SKL-OTA adds, and what the ESP32 already does
 
 SKL-OTA didn't invent A/B slots or rollback. Those come from the ESP32 itself:
 
 - **ESP-IDF and the bootloader provide:** two app slots, switching between them, and marking a new image "pending verify". If that image is never marked valid, the bootloader goes back to the previous slot at the next reset.
-- **SKL-OTA provides:** a release format that signs the board, build number, size and hash together; refusing old and foreign builds; checking the hash while the image streams in; a self-test window your code defines, with a timeout that triggers the rollback itself; a result that survives the reboot; and all of it in a background task with one small API.
+- **SKL-OTA provides:** a release format that signs the board, build number, size and hash together; refusing old and foreign builds; checking the hash while the image streams in; a self-test window your code defines, with a timeout that triggers the rollback itself; filesystem images tied to their build and written only once it has proven itself; a result that survives the reboot; and all of it in a background task with one small API.
+
+The filesystem partition is the exception to A/B: the ESP32 keeps only one copy, so a filesystem image is written in place. SKL-OTA can't make that write atomic. What it does is make sure it happens at the safest moment (after the self-test), remember an unfinished write, and retry it while the firmware keeps running.
 
 That's why it needs two app slots and rollback enabled (see [Install](#install)). The value isn't one new trick. It's tying the ESP32's built-in rollback to a signed release and a definition of "working" that your code supplies.
 
 ## How it differs from esp32FOTA
 
-[esp32FOTA](https://github.com/chrisjoyce911/esp32FOTA) is the best-known ESP32 pull-OTA library. It's mature, widely used, and does things SKL-OTA doesn't (filesystem image updates, semantic versions). It also supports signed firmware. The difference is **what** gets signed and **what happens after** the update. (Comparison based on esp32FOTA's README, October 2026.)
+[esp32FOTA](https://github.com/chrisjoyce911/esp32FOTA) is the best-known ESP32 pull-OTA library. It's mature, widely used, and does things SKL-OTA doesn't (semantic versions, updating the filesystem on its own). It also supports signed firmware. The difference is **what** gets signed and **what happens after** the update. (Comparison based on esp32FOTA's README, October 2026.)
 
 | | esp32FOTA | SKL-OTA |
 |---|---|---|
@@ -99,17 +109,17 @@ That's why it needs two app slots and rollback enabled (see [Install](#install))
 | Serve an **older** signed build to a device | Accepted if the server says it's newer: the version check uses the unsigned manifest | Refused: the build number is signed, and only higher builds install |
 | Serve a build signed for **other hardware** | Accepted if the signature is valid | Refused: the board is signed |
 | Signing required | Optional | Always on: there's no unsigned mode |
-| Firmware that installs but doesn't work | Stays installed (no rollback documented) | Rolled back automatically if `onSelfTest()` doesn't pass in time |
+| Firmware that installs but doesn't work | Stays installed (no rollback documented) | Rolled back automatically if `onSelfTest()` doesn't pass in time, including when the build hangs |
 | Result after reboot | Not documented | `lastResult()` survives the reboot, so the device can report "updated" or "rolled back" |
 | Where the work runs | Wherever you call it, blocking until done | Its own FreeRTOS task. Log lines come back on `loop()` |
-| Filesystem (SPIFFS/LittleFS) updates | Yes | No (app image only) |
+| Filesystem (SPIFFS/LittleFS) updates | Yes, as a separate update | Yes, as part of a release: signed, and written only after the new build passes its self-test |
 | Version format | Semantic versions | One whole number that only goes up (e.g. a git commit count) |
 
 **Why signing the release matters.** Signing only the image proves *you built it*. It doesn't prove *you meant this device to run it now*. Every build you ever signed stays valid forever, including the one with the bug you fixed last month. Anyone who controls the update server, its DNS, or a plain-HTTP network path can serve that old build with a manifest calling it "newer", and the device installs it. SKL-OTA signs the build number and board together with the hash, so a device only accepts a build you signed for that hardware, at a number above what it already runs.
 
-**Why rollback matters.** A correctly signed build can still be broken: a sensor driver that hangs, a WiFi change that never reconnects. Without rollback that device stays broken until someone plugs in a USB cable. SKL-OTA uses the ESP32 bootloader's rollback support, so a build that crashes, resets, or fails your self-test is replaced by the previous one automatically.
+**Why rollback matters.** A correctly signed build can still be broken: a sensor driver that hangs, a WiFi change that never reconnects. Without rollback that device stays broken until someone plugs in a USB cable. SKL-OTA uses the ESP32 bootloader's rollback support, so a build that crashes, resets, hangs, or fails your self-test is replaced by the previous one automatically. A hang is the tricky one: the build never resets, so nothing in `loop()` can be trusted to notice. The self-test deadline is therefore also held by a hardware-backed `esp_timer` that restarts the device when it runs out, and a restart while the build is still pending is all the bootloader needs to go back. Call `Ota.armRollbackGuard()` as the first line of `setup()` so that covers hangs during startup (sensor init, I2C, WiFi) too.
 
-Use esp32FOTA if you need filesystem updates or semantic versions, can reach your devices with a cable, and control the whole delivery path. Use SKL-OTA when a bad release has to fix itself (see [Do you need it?](#do-you-need-it)) or the update path isn't fully trusted, such as a home network, plain HTTP, or third-party hosting.
+Use esp32FOTA if you need semantic versions or filesystem updates independent of the firmware, can reach your devices with a cable, and control the whole delivery path. Use SKL-OTA when a bad release has to fix itself (see [Do you need it?](#do-you-need-it)) or the update path isn't fully trusted, such as a home network, plain HTTP, or third-party hosting.
 
 ## Install
 
@@ -150,7 +160,8 @@ It also writes the **public key** to `include/ota_pubkey.h` as `OTA_PUBKEY_PEM`.
 #define BUILD 7   // raise with every release
 
 void setup() {
-  // ... WiFi.begin(...) ...
+  Ota.armRollbackGuard();   // first line: a new build that hangs anywhere below still rolls back
+  // ... sensors, WiFi.begin(...) ...
   Ota.setManifestUrl("https://example.com/fw/manifest.json");
   Ota.onLog([](int sev, const char* msg) { Serial.println(msg); });
   Ota.onSelfTest([](String& status) {        // what "working" means for you
@@ -207,6 +218,46 @@ Upload all three so your manifest URL returns that JSON, and the files are at it
 python tools/ota_release.py verify releases/8/manifest.json
 ```
 
+### Shipping a filesystem image too
+
+If your firmware serves pages or reads files from SPIFFS / LittleFS, ship that image with the build so the two always match:
+
+```sh
+pio run -t buildfs      # makes .pio/build/<env>/littlefs.bin (or spiffs.bin)
+python tools/ota_release.py sign --bin .pio/build/esp32dev/firmware.bin \
+    --fs-bin .pio/build/esp32dev/littlefs.bin --fs-size 0xE0000 \
+    --board kitchen-sensor-v2 --build 8 --url-base https://example.com/fw
+```
+
+This adds `filesystem-8.bin` (and its `.zz`, usually tiny: a 896 KB LittleFS partition holding 230 KB of pages compresses to 131 KB) and an `"fs"` block in the manifest with its own size, SHA-256, signature and URLs. The filesystem signature covers `"<context>-fs|<board>|<build>|<size>|<sha256>"`, so it can't be reused for another build or passed off as firmware.
+
+On the device, tell SKL-OTA how to step aside while the image is written:
+
+```cpp
+#include <LittleFS.h>
+
+Ota.onFilesystemUpdate([](bool starting, bool ok) {
+  if (starting) {
+    LittleFS.end();                 // stop serving files: the partition is about to be rewritten
+  } else if (ok) {
+    ESP.restart();                  // simplest way to pick up the new files everywhere
+  } else {
+    LittleFS.begin(true);           // failed: remount (formats if unreadable); SKL-OTA retries later
+  }
+});
+```
+
+The order on the device:
+
+1. The check verifies both signatures. A release whose filesystem image doesn't verify, or doesn't fit the partition, isn't installed at all.
+2. The app image installs and the device restarts into it. The filesystem isn't touched yet.
+3. Once the new build passes its self-test, SKL-OTA calls `onFilesystemUpdate(true, …)`, writes the image (compressed copy if offered, SHA-256 checked), then calls `onFilesystemUpdate(false, ok)`.
+4. If the write fails or the power drops halfway, the device remembers and writes it again after 1, 2, 4… minutes, at most hourly. The firmware keeps running throughout, only without its files until the write succeeds.
+
+An image identical to the one already written (same SHA-256) is skipped, so a release that didn't change the files doesn't rewrite the partition. Without `onFilesystemUpdate()`, or with `updateFilesystem = false`, filesystem images are never written.
+
+### Your own server
+
 Your manifest URL can also point at your own server code instead of a static file. Return the newest build that device should get, or **204 / 404** when there's nothing for it. That's how you run beta and stable channels, or roll out to some devices first.
 
 ## API
@@ -223,8 +274,10 @@ Your manifest URL can also point at your own server code instead of a static fil
 | `onNetworkReady(bool())` | Whether automatic checks may run right now. Default: WiFi is connected. |
 | `onChange(void())` | The state, message or progress changed (e.g. redraw a screen). Can run on any task, so keep it to setting a flag. |
 | `onRestart(void())` | The new image is written and verified. Default: wait 2 s, then `ESP.restart()`. Replace it to restart from `loop()` after saving state. |
-| `onRollback(void(const char* why))` | The self-test failed and the device is about to reboot into the previous build. Save state or show a message. |
-| `begin(const SKLOtaConfig&)` | Reads the saved install record and starts the self-test if this is a fresh update. Call once in `setup()` after your logger is ready. |
+| `onRollback(void(const char* why))` | The self-test failed and the device is about to reboot into the previous build. Save state or show a message. Not called when the build hung and the rollback timer had to force the restart. |
+| `onFilesystemUpdate(void(bool starting, bool ok))` | Before a filesystem image is written (`starting`): unmount it. After (`ok` = success): remount or restart. Runs in `loop()`. Required for filesystem images to be written. |
+| `armRollbackGuard(uint32_t timeoutMs = 10 min)` | Optional, first line of `setup()`. If this boot is a new build on probation, starts the timer that forces the rollback when the self-test deadline passes, even if `loop()` is stuck. Does nothing on a normal boot. Pass your `selfTestTimeoutMs` if you changed it. |
+| `begin(const SKLOtaConfig&)` | Reads the saved install record and starts the self-test if this is a fresh update (and the rollback timer, if `armRollbackGuard()` didn't already). Call once in `setup()` after your logger is ready. |
 | `loop()` | Call every `loop()` pass. Cheap when there's nothing to do. |
 
 ### Actions (safe from any task: web handlers, buttons, console)
@@ -242,9 +295,10 @@ Your manifest URL can also point at your own server code instead of a static fil
 | `stateName()` | The same as text: `"idle"`, `"checking"`, `"up_to_date"`, `"available"`, `"installing"`, `"failed"` |
 | `message()` | One line for a screen or status page, e.g. `"Build 8 available"`, `"Signature check FAILED"` |
 | `progress()` | Install progress 0–100, or -1 |
-| `offer()` | The verified release on offer (`build`, `version`, `size`, `url`, and `zurl` / `zsize` when there's a compressed copy) when the state is `Available` |
+| `offer()` | The verified release on offer (`build`, `version`, `size`, `url`, `zurl` / `zsize` for a compressed copy, and `fs` for a filesystem image) when the state is `Available` |
 | `lastResult()` | Outcome of the last install, kept across reboots: `"Updated to build 8"` or `"Build 8 failed self-test; rolled back"` |
 | `pendingVerify()` | `true` while a new build is still proving itself. Installs wait until it's done. |
+| `filesystemPending()` | `true` while this build's filesystem image is still to be written (waiting for the self-test, the network, or a retry) |
 | `supported()` | `false` on a single-app-slot partition table |
 | `busy()` | A check or install is queued or running |
 | `build()` | The running build number from the config |
@@ -261,8 +315,9 @@ Your manifest URL can also point at your own server code instead of a static fil
 | `firstCheckMs` | 5 min | First automatic check after boot. `0` turns automatic checks off. |
 | `checkIntervalMs` | 12 h | Time between automatic checks. `0` means only the first one. |
 | `selfTestMinUptimeMs` | 1 min | A new build must stay up at least this long… |
-| `selfTestTimeoutMs` | 10 min | …and pass its self-test within this, or it's rolled back. |
+| `selfTestTimeoutMs` | 10 min | …and pass its self-test within this, or it's rolled back. If `loop()` is stuck, the rollback timer forces it 30 s after this. |
 | `taskStack` | 12288 | Stack bytes for the check/install task. |
+| `updateFilesystem` | `true` | Write a release's filesystem image (needs `onFilesystemUpdate()`). `false` installs the app only. |
 | `allowCompressed` | `true` | Download the compressed copy when the manifest offers one. It needs about 44 KB of free heap during the install (a 32 KB window plus the decompressor's state), freed afterwards. If the compressed download fails before anything is written, the device falls back to the plain image. |
 
 ## What the device sees
@@ -276,6 +331,9 @@ Your manifest URL can also point at your own server code instead of a static fil
 | Download corrupted | `Failed` / "Checksum mismatch -- file corrupted" (old firmware keeps running) |
 | Image too big for the slot | `Failed` / "Update too big for slot" |
 | Single-slot partition table | `Failed` / "Needs USB flash w/ OTA layout" |
+| Filesystem signature doesn't verify | `Failed` / "Filesystem signature check FAILED" (nothing installed) |
+| Writing the filesystem image | `Installing` / "Updating files" |
+| Filesystem write failed | `Failed` / "Files update failed" (retried automatically) |
 
 ## Security notes
 
@@ -283,6 +341,7 @@ Your manifest URL can also point at your own server code instead of a static fil
 - **TLS is optional.** The signature already proves the firmware is yours, so plain HTTP on a LAN is safe for the firmware itself. Use HTTPS if your `onRequest` headers carry credentials.
 - **Rotating the key** takes two releases: one signed with the old key that contains the new public key, then everything after it signed with the new key.
 - **Downgrades are blocked by design.** To go back, release the old code with a new, higher build number.
+- **Filesystem images are signed too, and that's not optional.** They can't run code on the ESP32, but they're what your device serves to a browser. A tampered `admin.html` runs in the browser of whoever opens it, with that page's access to your device: it can capture the admin password or use the open session to change settings. So a filesystem image passes the same checks as firmware.
 - **The compressed copy isn't signed separately; what it inflates to is.** The device decompresses the stream *before* it can check the result, so a hostile server can feed the decompressor bad data. That data only reaches the unused update slot, and the update is refused unless the output matches the signed size and SHA-256. The decompressor (tinfl, in the ESP32's ROM) is the same one the chip's ROM uses when esptool flashes a compressed image over serial. If you'd rather not decompress anything unverified, set `allowCompressed = false`.
 
 ## Tests
@@ -293,6 +352,10 @@ Your manifest URL can also point at your own server code instead of a static fil
 git clone -b 3.0.2 https://github.com/richgel999/miniz.git
 MINIZ_DIR=miniz test/host/run.sh path/to/firmware.bin
 ```
+
+`tools/test_ota_release.sh` runs the release tool end to end with a throwaway key: keygen, sign (firmware + filesystem image), verify, and checks that verify **rejects** a changed build number or board, a swapped signature, the wrong signing context, a modified image and a corrupted compressed copy.
+
+CI (`.github/workflows/ci.yml`) runs both on every push, compiles `examples/Basic` for an ESP32, and on a `v*` tag checks that the tag matches the version in `library.json`, `library.properties` and `SKLOta.h`.
 
 ## Example
 

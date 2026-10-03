@@ -10,6 +10,10 @@
 #include <Update.h>
 #include <WiFi.h>
 #include <esp_ota_ops.h>
+#include <esp_partition.h>
+#include <esp_system.h>
+#include <esp_timer.h>
+#include <new>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 #include <mbedtls/md.h>
@@ -23,6 +27,27 @@ SKLOta Ota;
 extern "C" bool verifyRollbackLater() { return true; }
 
 namespace {
+
+// How long after selfTestTimeoutMs the hang guard waits before forcing the
+// rollback. While loop() is alive, selfTestLoop() handles the timeout itself
+// (logging it and calling onRollback()); the guard is only the backstop for
+// a build where loop() is stuck.
+constexpr uint32_t GUARD_GRACE_MS = 30UL * 1000;
+
+bool runningIsPendingVerify() {
+  const esp_partition_t* running = esp_ota_get_running_partition();
+  esp_ota_img_states_t st;
+  return running && esp_ota_get_state_partition(running, &st) == ESP_OK && st == ESP_OTA_IMG_PENDING_VERIFY;
+}
+
+// Runs on the esp_timer task, which a stuck loop() can't block. A restart
+// while the image is still PENDING_VERIFY is all the bootloader needs: it
+// marks the image aborted and boots the previous slot. Kept to that one
+// call on purpose -- no logging, NVS or flash work from here.
+void rollbackGuardFired(void*) {
+  if (!esp_ota_check_rollback_is_possible()) return;  // nothing to go back to
+  esp_restart();
+}
 
 // The slot an update would go into, or nullptr with a single-app layout.
 const esp_partition_t* nextSlot() {
@@ -76,6 +101,14 @@ void resolveUrl(const char* manifestUrl, const char* url, char* out, size_t len)
   snprintf(out, len, "%.*s%s", (int)originLen, manifestUrl, url);
 }
 
+// The data partition a filesystem image is written to (what Update's
+// U_SPIFFS writes): the SPIFFS/LittleFS partition, else a FAT one.
+const esp_partition_t* filesystemPartition() {
+  const esp_partition_t* p = esp_partition_find_first(ESP_PARTITION_TYPE_DATA, ESP_PARTITION_SUBTYPE_DATA_SPIFFS, nullptr);
+  if (!p) p = esp_partition_find_first(ESP_PARTITION_TYPE_DATA, ESP_PARTITION_SUBTYPE_DATA_FAT, nullptr);
+  return p;
+}
+
 }  // namespace
 
 // ---- setup -----------------------------------------------------------------
@@ -88,6 +121,7 @@ void SKLOta::onNetworkReady(BoolFn fn) { networkReadyFn_ = fn; }
 void SKLOta::onChange(VoidFn fn) { changeFn_ = fn; }
 void SKLOta::onRestart(VoidFn fn) { restartFn_ = fn; }
 void SKLOta::onRollback(RollbackFn fn) { rollbackFn_ = fn; }
+void SKLOta::onFilesystemUpdate(FilesystemFn fn) { filesystemFn_ = fn; }
 
 void SKLOta::requestCheck() { if (request_ < 1) request_ = 1; }
 void SKLOta::requestInstall() { request_ = 2; }
@@ -125,12 +159,16 @@ void SKLOta::setMessage(SKLOtaState st, const char* msg) {
   if (changeFn_) changeFn_();
 }
 
+// The outcome of an install, kept across reboots. "report" asks for a check
+// soon (even after a restart), so a server that records results hears it.
 void SKLOta::saveResult(const char* msg) {
   strncpy(lastResult_, msg, sizeof(lastResult_) - 1);
   lastResult_[sizeof(lastResult_) - 1] = '\0';
+  reportPending_ = true;
   Preferences prefs;
   if (prefs.begin(cfg_.nvsNamespace, false)) {
     prefs.putString("result", lastResult_);
+    prefs.putBool("report", true);
     prefs.end();
   }
 }
@@ -144,7 +182,57 @@ void SKLOta::clearInstallRecord() {
   }
 }
 
+// ---- filesystem record (NVS) --------------------------------------------------------
+//   fs_for   build the pending image belongs to     fs_busy  a write started, not finished
+//   fs_url / fs_zurl / fs_size / fs_zsize / fs_sha  the image (signature checked before saving)
+//   fs_done  SHA-256 of the image last written (so an unchanged image isn't rewritten)
+void SKLOta::rememberFilesystem(const SKLOtaRelease& m) {
+  Preferences prefs;
+  if (!prefs.begin(cfg_.nvsNamespace, false)) return;
+  String done = prefs.getString("fs_done", "");
+  if (!m.fs.size || !cfg_.updateFilesystem || done == m.fs.sha256) {
+    prefs.remove("fs_for");  // nothing to write for this build
+  } else {
+    prefs.putULong("fs_for", m.build);
+    prefs.putString("fs_url", m.fs.url);
+    prefs.putString("fs_zurl", m.fs.zurl);
+    prefs.putULong("fs_size", m.fs.size);
+    prefs.putULong("fs_zsize", m.fs.zsize);
+    prefs.putString("fs_sha", m.fs.sha256);
+  }
+  prefs.end();
+}
+
+void SKLOta::clearFilesystemRecord() {
+  Preferences prefs;
+  if (prefs.begin(cfg_.nvsNamespace, false)) {
+    for (const char* k : {"fs_for", "fs_url", "fs_zurl", "fs_size", "fs_zsize", "fs_sha"}) prefs.remove(k);
+    prefs.end();
+  }
+}
+
 // ---- manifest ------------------------------------------------------------------
+static bool parseImageUrls(JsonVariantConst o, const char* manifestUrl, char* url, size_t urlLen, char* zurl,
+                           size_t zurlLen, uint32_t& zsize) {
+  const char* u = o["url"] | "";
+  if (!u[0]) return false;
+  resolveUrl(manifestUrl, u, url, urlLen);
+  if (strncasecmp(url, "http", 4) != 0) return false;
+  // Optional zlib-compressed copy of the same image. Not signed itself: what
+  // it inflates to must still match the signed size and SHA-256.
+  zurl[0] = '\0';
+  zsize = 0;
+  const char* comp = o["compression"] | "";
+  const char* z = o["compressed_url"] | "";
+  uint32_t zs = o["compressed_size"] | 0UL;
+  if (strcmp(comp, "zlib") == 0 && z[0] && zs) {
+    resolveUrl(manifestUrl, z, zurl, zurlLen);
+    if (strncasecmp(zurl, "http", 4) == 0) zsize = zs;
+    else zurl[0] = '\0';
+  }
+  return true;
+}
+
 bool SKLOta::fetchManifest(SKLOtaRelease& m, bool& nonePublished, char* why, size_t whyLen) {
   nonePublished = false;
   static char url[224];
@@ -175,48 +263,51 @@ bool SKLOta::fetchManifest(SKLOtaRelease& m, bool& nonePublished, char* why, siz
   if (err) { snprintf(why, whyLen, "Update info unreadable"); return false; }
 
   const char* board = doc["board"] | "";
-  const char* fileUrl = doc["url"] | "";
   const char* sha = doc["sha256"] | "";
   const char* sig = doc["sig"] | "";
   const char* ver = doc["version"] | "";
   m.build = doc["build"] | 0UL;
   m.size = doc["size"] | 0UL;
   if (strcmp(board, cfg_.board) != 0) { snprintf(why, whyLen, "Update is for other hardware"); return false; }
-  if (!m.build || !m.size || !fileUrl[0] || !isHex(sha, 64, 64) || !isHex(sig, 16, sizeof(m.sig) - 1)) {
+  if (!m.build || !m.size || !isHex(sha, 64, 64) || !isHex(sig, 16, sizeof(m.sig) - 1) ||
+      !parseImageUrls(doc.as<JsonVariantConst>(), url, m.url, sizeof(m.url), m.zurl, sizeof(m.zurl), m.zsize)) {
     snprintf(why, whyLen, "Update info incomplete");
     return false;
   }
-  resolveUrl(url, fileUrl, m.url, sizeof(m.url));
-  if (strncasecmp(m.url, "http", 4) != 0) { snprintf(why, whyLen, "Update file URL invalid"); return false; }
   snprintf(m.sha256, sizeof(m.sha256), "%s", sha);
   for (char* c = m.sha256; *c; c++) *c = tolower(*c);
   snprintf(m.sig, sizeof(m.sig), "%s", sig);
   snprintf(m.version, sizeof(m.version), "%s", ver);
 
-  // Optional zlib-compressed copy of the same image. Not signed itself: what
-  // it inflates to must still match the signed size and SHA-256.
-  m.zurl[0] = '\0';
-  m.zsize = 0;
-  const char* comp = doc["compression"] | "";
-  const char* zurl = doc["compressed_url"] | "";
-  uint32_t zsize = doc["compressed_size"] | 0UL;
-  if (strcmp(comp, "zlib") == 0 && zurl[0] && zsize) {
-    resolveUrl(url, zurl, m.zurl, sizeof(m.zurl));
-    if (strncasecmp(m.zurl, "http", 4) == 0) m.zsize = zsize;
-    else m.zurl[0] = '\0';
+  // Optional filesystem image for this build.
+  m.fs = SKLOtaImage();
+  JsonVariantConst fs = doc["fs"];
+  if (!fs.isNull()) {
+    const char* fsha = fs["sha256"] | "";
+    const char* fsig = fs["sig"] | "";
+    m.fs.size = fs["size"] | 0UL;
+    if (!m.fs.size || !isHex(fsha, 64, 64) || !isHex(fsig, 16, sizeof(m.fs.sig) - 1) ||
+        !parseImageUrls(fs, url, m.fs.url, sizeof(m.fs.url), m.fs.zurl, sizeof(m.fs.zurl), m.fs.zsize)) {
+      snprintf(why, whyLen, "Filesystem info incomplete");
+      return false;
+    }
+    snprintf(m.fs.sha256, sizeof(m.fs.sha256), "%s", fsha);
+    for (char* c = m.fs.sha256; *c; c++) *c = tolower(*c);
+    snprintf(m.fs.sig, sizeof(m.fs.sig), "%s", fsig);
   }
   return true;
 }
 
 // ---- signature -----------------------------------------------------------------
-bool SKLOta::verifySignature(const SKLOtaRelease& m, char* why, size_t whyLen) {
+bool SKLOta::verifySignature(const char* contextSuffix, uint32_t build, uint32_t size, const char* sha256,
+                             const char* sigHex, char* why, size_t whyLen) {
   if (!cfg_.publicKeyPem || !cfg_.publicKeyPem[0]) {
     snprintf(why, whyLen, "No signing key in this build");
     return false;
   }
-  char msg[200];
-  snprintf(msg, sizeof(msg), "%s|%s|%lu|%lu|%s", cfg_.signContext, cfg_.board,
-           (unsigned long)m.build, (unsigned long)m.size, m.sha256);
+  char msg[220];
+  snprintf(msg, sizeof(msg), "%s%s|%s|%lu|%lu|%s", cfg_.signContext, contextSuffix, cfg_.board,
+           (unsigned long)build, (unsigned long)size, sha256);
   uint8_t hash[32];
   const mbedtls_md_info_t* md = mbedtls_md_info_from_type(MBEDTLS_MD_SHA256);
   if (!md || mbedtls_md(md, (const unsigned char*)msg, strlen(msg), hash) != 0) {
@@ -224,8 +315,8 @@ bool SKLOta::verifySignature(const SKLOtaRelease& m, char* why, size_t whyLen) {
     return false;
   }
   uint8_t sig[80];
-  size_t sigLen = strlen(m.sig) / 2;
-  if (sigLen > sizeof(sig) || !hexToBytes(m.sig, sig, sigLen)) {
+  size_t sigLen = strlen(sigHex) / 2;
+  if (sigLen > sizeof(sig) || !hexToBytes(sigHex, sig, sigLen)) {
     snprintf(why, whyLen, "Signature malformed");
     return false;
   }
@@ -235,7 +326,7 @@ bool SKLOta::verifySignature(const SKLOtaRelease& m, char* why, size_t whyLen) {
   if (rc == 0) rc = mbedtls_pk_verify(&pk, MBEDTLS_MD_SHA256, hash, sizeof(hash), sig, sigLen);
   mbedtls_pk_free(&pk);
   if (rc != 0) {
-    snprintf(why, whyLen, "Signature check FAILED");
+    snprintf(why, whyLen, contextSuffix[0] ? "Filesystem signature check FAILED" : "Signature check FAILED");
     return false;
   }
   return true;
@@ -252,43 +343,65 @@ void SKLOta::doCheck() {
     postLog(2, "Update check: single app slot -- flash once over USB with a two-slot (OTA) partition table");
     return;
   }
-  SKLOtaRelease& m = scratch_;
+  SKLOtaRelease* mp = new (std::nothrow) SKLOtaRelease();
+  if (!mp) { setMessage(SKLOtaState::Failed, "Out of memory"); return; }
+  SKLOtaRelease& m = *mp;
   bool none = false;
   char why[64];
-  if (!fetchManifest(m, none, why, sizeof(why))) {
+  char msg[160];
+  bool fetched = fetchManifest(m, none, why, sizeof(why));
+  if (fetched || none) {  // the server heard this check (and any result headers)
+    Preferences prefs;
+    if (prefs.begin(cfg_.nvsNamespace, false)) { prefs.remove("report"); prefs.end(); }
+  }
+  if (!fetched) {
     setMessage(none ? SKLOtaState::UpToDate : SKLOtaState::Failed, why);
     if (!none) {
-      char msg[120];
       snprintf(msg, sizeof(msg), "Update check failed: %s", why);
       postLog(2, msg);
     }
-    return;
-  }
-  char msg[160];
-  if (m.build <= cfg_.build) {
+  } else if (m.build <= cfg_.build) {
     snprintf(msg, sizeof(msg), "Up to date (build %lu)", (unsigned long)cfg_.build);
     setMessage(SKLOtaState::UpToDate, msg);
-    return;
-  }
-  if (m.size > next->size) {
+  } else if (m.size > next->size) {
     setMessage(SKLOtaState::Failed, "Update too big for slot");
     snprintf(msg, sizeof(msg), "Update build %lu is %lu bytes; the update slot holds %lu",
              (unsigned long)m.build, (unsigned long)m.size, (unsigned long)next->size);
     postLog(1, msg);
-    return;
-  }
-  if (!verifySignature(m, why, sizeof(why))) {
+  } else if (!verifySignature("", m.build, m.size, m.sha256, m.sig, why, sizeof(why))) {
     setMessage(SKLOtaState::Failed, why);
     snprintf(msg, sizeof(msg), "Update build %lu rejected: %s", (unsigned long)m.build, why);
     postLog(1, msg);
-    return;
+  } else {
+    bool ok = true;
+    if (m.fs.size && !cfg_.updateFilesystem) {
+      m.fs = SKLOtaImage();  // filesystem updates are off: install the app only
+    } else if (m.fs.size) {
+      // The pages/files must arrive with their build, so a release whose
+      // filesystem image can't be used isn't installed at all.
+      const esp_partition_t* fsPart = filesystemPartition();
+      if (!fsPart || m.fs.size > fsPart->size) {
+        snprintf(why, sizeof(why), fsPart ? "Filesystem image too big" : "No filesystem partition");
+        ok = false;
+      } else if (!verifySignature("-fs", m.build, m.fs.size, m.fs.sha256, m.fs.sig, why, sizeof(why))) {
+        ok = false;
+      }
+      if (!ok) {
+        setMessage(SKLOtaState::Failed, why);
+        snprintf(msg, sizeof(msg), "Update build %lu rejected: %s", (unsigned long)m.build, why);
+        postLog(1, msg);
+      }
+    }
+    if (ok) {
+      offer_ = m;
+      snprintf(msg, sizeof(msg), "Build %lu available", (unsigned long)m.build);
+      setMessage(SKLOtaState::Available, msg);
+      snprintf(msg, sizeof(msg), "Update available: build %lu (%s), %lu bytes%s, signature OK",
+               (unsigned long)m.build, m.version, (unsigned long)m.size, m.fs.size ? " + filesystem" : "");
+      postLog(3, msg);
+    }
   }
-  offer_ = m;
-  snprintf(msg, sizeof(msg), "Build %lu available", (unsigned long)m.build);
-  setMessage(SKLOtaState::Available, msg);
-  snprintf(msg, sizeof(msg), "Update available: build %lu (%s), %lu bytes, signature OK",
-           (unsigned long)m.build, m.version, (unsigned long)m.size);
-  postLog(3, msg);
+  delete mp;
 }
 
 // ---- install --------------------------------------------------------------------------
@@ -300,12 +413,11 @@ void SKLOta::fail(const char* why) {
   setMessage(SKLOtaState::Failed, why);
 }
 
-// Streams one URL into the update slot, hashing the image as it's written.
+// Streams one URL into the open Update, hashing the image as it's written.
 // compressed: the body is a zlib stream that inflates to the image.
-bool SKLOta::download(const char* url, uint32_t expectBytes, bool compressed, uint32_t& got,
+bool SKLOta::download(const char* url, uint32_t expectBytes, bool compressed, uint32_t imageSize, uint32_t& got,
                       const char*& failWhy, void* hashCtx, char* msg, size_t msgLen) {
   mbedtls_md_context_t* ctx = (mbedtls_md_context_t*)hashCtx;
-  const uint32_t imageSize = offer_.size;
   got = 0;
   HTTPClient http;
   http.setTimeout(15000);
@@ -377,6 +489,57 @@ bool SKLOta::download(const char* url, uint32_t expectBytes, bool compressed, ui
   return ok;
 }
 
+// Writes one image (app slot: U_FLASH, filesystem: U_SPIFFS) and checks it
+// against the signed SHA-256. Update.end() is the caller's (for U_FLASH it
+// switches the boot slot).
+bool SKLOta::writeImage(int command, uint32_t size, const char* url, const char* zurl, uint32_t zsize,
+                        const char* sha256, const char*& failWhy, char* why, size_t whyLen) {
+  failWhy = nullptr;
+  if (!Update.begin(size, command)) {
+    snprintf(why, whyLen, "Can't start update: %s", Update.errorString());
+    failWhy = why;
+    return false;
+  }
+  mbedtls_md_context_t ctx;
+  mbedtls_md_init(&ctx);
+  if (mbedtls_md_setup(&ctx, mbedtls_md_info_from_type(MBEDTLS_MD_SHA256), 0) != 0 || mbedtls_md_starts(&ctx) != 0) {
+    mbedtls_md_free(&ctx);
+    Update.abort();
+    failWhy = "Out of memory";
+    return false;
+  }
+  bool compressed = cfg_.allowCompressed && zurl[0] && zsize;
+  uint32_t got = 0;
+  bool ok = download(compressed ? zurl : url, compressed ? zsize : size, compressed, size, got, failWhy, &ctx,
+                     why, whyLen);
+  if (!ok && compressed && got == 0) {
+    // Nothing written yet (e.g. the compressed file isn't there): fall back
+    // to the plain image rather than fail the update.
+    char msg[160];
+    snprintf(msg, sizeof(msg), "Compressed download failed (%s) -- trying the uncompressed image", failWhy ? failWhy : "?");
+    postLog(2, msg);
+    mbedtls_md_starts(&ctx);
+    failWhy = nullptr;
+    ok = download(url, size, false, size, got, failWhy, &ctx, why, whyLen);
+  }
+  uint8_t hash[32];
+  bool hashed = ok && mbedtls_md_finish(&ctx, hash) == 0;
+  mbedtls_md_free(&ctx);
+  if (!ok || !hashed || got != size) {
+    Update.abort();
+    if (!failWhy) failWhy = "Download incomplete";
+    return false;
+  }
+  char hex[65];
+  bytesToHexLower(hash, sizeof(hash), hex);
+  if (strcmp(hex, sha256) != 0) {
+    Update.abort();
+    failWhy = "Checksum mismatch -- file corrupted";
+    return false;
+  }
+  return true;
+}
+
 void SKLOta::doInstall() {
   if (state_ != SKLOtaState::Available) {
     doCheck();
@@ -391,47 +554,10 @@ void SKLOta::doInstall() {
   progress_ = 0;
   setMessage(SKLOtaState::Installing, "Downloading...");
 
-  if (!Update.begin(m.size, U_FLASH)) {
-    snprintf(msg, sizeof(msg), "Can't start update: %s", Update.errorString());
-    fail(msg);
-    return;
-  }
-  mbedtls_md_context_t ctx;
-  mbedtls_md_init(&ctx);
-  if (mbedtls_md_setup(&ctx, mbedtls_md_info_from_type(MBEDTLS_MD_SHA256), 0) != 0 || mbedtls_md_starts(&ctx) != 0) {
-    mbedtls_md_free(&ctx);
-    Update.abort();
-    fail("Out of memory");
-    return;
-  }
-  uint32_t got = 0;
   const char* failWhy = nullptr;
-  char why[48];
-  bool ok = download(compressed ? m.zurl : m.url, compressed ? m.zsize : m.size, compressed, got, failWhy, &ctx,
-                     why, sizeof(why));
-  if (!ok && compressed && got == 0) {
-    // Nothing written yet (e.g. the compressed file isn't there): fall back
-    // to the plain image rather than fail the update.
-    snprintf(msg, sizeof(msg), "Compressed download failed (%s) -- trying the uncompressed image", failWhy ? failWhy : "?");
-    postLog(2, msg);
-    mbedtls_md_starts(&ctx);
-    failWhy = nullptr;
-    ok = download(m.url, m.size, false, got, failWhy, &ctx, why, sizeof(why));
-  }
-  uint8_t hash[32];
-  bool hashed = ok && mbedtls_md_finish(&ctx, hash) == 0;
-  mbedtls_md_free(&ctx);
-
-  if (!ok || !hashed || got != m.size) {
-    Update.abort();
-    fail(failWhy ? failWhy : "Download incomplete");
-    return;
-  }
-  char hex[65];
-  bytesToHexLower(hash, sizeof(hash), hex);
-  if (strcmp(hex, m.sha256) != 0) {
-    Update.abort();
-    fail("Checksum mismatch -- file corrupted");
+  char why[64];
+  if (!writeImage(U_FLASH, m.size, m.url, m.zurl, m.zsize, m.sha256, failWhy, why, sizeof(why))) {
+    fail(failWhy);
     return;
   }
   setMessage(SKLOtaState::Installing, "Verifying...");
@@ -448,6 +574,7 @@ void SKLOta::doInstall() {
     prefs.putString("to_ver", m.version);
     prefs.end();
   }
+  rememberFilesystem(m);  // written by the new build once it passes its self-test
   progress_ = 100;
   snprintf(msg, sizeof(msg), "Update to build %lu written and checksum-verified -- restarting", (unsigned long)m.build);
   postLog(3, msg);
@@ -460,26 +587,118 @@ void SKLOta::doInstall() {
   }
 }
 
+// Writes this build's filesystem image. loop() has already called
+// onFilesystemUpdate(true), so nothing is using the filesystem.
+void SKLOta::doFilesystemInstall() {
+  fsOk_ = false;
+  String url, zurl, sha;
+  uint32_t size = 0, zsize = 0;
+  Preferences prefs;
+  if (prefs.begin(cfg_.nvsNamespace, false)) {
+    url = prefs.getString("fs_url", "");
+    zurl = prefs.getString("fs_zurl", "");
+    sha = prefs.getString("fs_sha", "");
+    size = prefs.getULong("fs_size", 0);
+    zsize = prefs.getULong("fs_zsize", 0);
+    prefs.putBool("fs_busy", true);  // cleared only when the image is fully written
+    prefs.end();
+  }
+  char msg[200];
+  if (!size || url.isEmpty() || sha.length() != 64) {
+    postLog(1, "Filesystem update record is incomplete -- skipped");
+    clearFilesystemRecord();
+    fsPending_ = false;
+    setMessage(SKLOtaState::Failed, "Files update skipped");
+    return;
+  }
+  bool compressed = cfg_.allowCompressed && zurl.length() && zsize;
+  snprintf(msg, sizeof(msg), "Writing the filesystem image for build %lu from %s%s", (unsigned long)cfg_.build,
+           compressed ? zurl.c_str() : url.c_str(), compressed ? " (compressed)" : "");
+  postLog(3, msg);
+  progress_ = 0;
+  setMessage(SKLOtaState::Installing, "Updating files");
+
+  const char* failWhy = nullptr;
+  char why[64];
+  bool ok = writeImage(U_SPIFFS, size, url.c_str(), zurl.c_str(), zsize, sha.c_str(), failWhy, why, sizeof(why));
+  if (ok && !Update.end()) {
+    snprintf(why, sizeof(why), "Write not finished: %s", Update.errorString());
+    failWhy = why;
+    ok = false;
+  }
+  progress_ = -1;
+  if (!ok) {
+    snprintf(msg, sizeof(msg), "Filesystem update failed: %s -- will retry", failWhy ? failWhy : "?");
+    postLog(1, msg);
+    setMessage(SKLOtaState::Failed, "Files update failed");
+    return;
+  }
+  if (prefs.begin(cfg_.nvsNamespace, false)) {
+    prefs.putString("fs_done", sha);
+    prefs.remove("fs_busy");
+    prefs.end();
+  }
+  clearFilesystemRecord();
+  fsPending_ = false;
+  fsOk_ = true;
+  snprintf(msg, sizeof(msg), "Updated to build %lu + files", (unsigned long)cfg_.build);
+  saveResult(msg);
+  setMessage(SKLOtaState::Idle, msg);
+  snprintf(msg, sizeof(msg), "Filesystem image for build %lu written and checksum-verified", (unsigned long)cfg_.build);
+  postLog(3, msg);
+}
+
 void SKLOta::taskEntry(void* arg) {
   uint8_t what = (uint8_t)(uintptr_t)arg;
-  if (what == 2) Ota.doInstall();
+  if (what == 3) Ota.doFilesystemInstall();
+  else if (what == 2) Ota.doInstall();
   else Ota.doCheck();
   Ota.busy_ = false;
   vTaskDelete(nullptr);
 }
 
 // ---- boot / self-test --------------------------------------------------------------
+bool SKLOta::armRollbackGuard(uint32_t selfTestTimeoutMs) {
+  if (!runningIsPendingVerify()) return false;
+  if (!guardTimer_) {
+    esp_timer_create_args_t args = {};
+    args.callback = rollbackGuardFired;
+    args.name = "skl_ota_guard";
+    if (esp_timer_create(&args, &guardTimer_) != ESP_OK) {
+      guardTimer_ = nullptr;
+      return false;
+    }
+  } else {
+    esp_timer_stop(guardTimer_);  // re-arm with this deadline (fine if it wasn't running)
+  }
+  // The deadline counts from boot, the same clock selfTestLoop() uses.
+  uint64_t deadlineMs = (uint64_t)selfTestTimeoutMs + GUARD_GRACE_MS;
+  uint64_t upMs = millis();
+  uint64_t leftMs = deadlineMs > upMs ? deadlineMs - upMs : 1000;
+  return esp_timer_start_once(guardTimer_, leftMs * 1000ULL) == ESP_OK;
+}
+
+void SKLOta::disarmRollbackGuard() {
+  if (!guardTimer_) return;
+  esp_timer_stop(guardTimer_);
+  esp_timer_delete(guardTimer_);
+  guardTimer_ = nullptr;
+}
+
 bool SKLOta::begin(const SKLOtaConfig& config) {
   cfg_ = config;
   if (!cfg_.signContext) cfg_.signContext = "skl-ota";
   if (!cfg_.nvsNamespace) cfg_.nvsNamespace = "skl_ota";
 
-  const esp_partition_t* running = esp_ota_get_running_partition();
-  esp_ota_img_states_t st;
-  pendingVerify_ = running && esp_ota_get_state_partition(running, &st) == ESP_OK &&
-                   st == ESP_OTA_IMG_PENDING_VERIFY;
+  pendingVerify_ = runningIsPendingVerify();
+  // Hang protection from here on (or re-armed with this config's timeout,
+  // if armRollbackGuard() already ran earlier in setup()).
+  if (pendingVerify_ && !armRollbackGuard(cfg_.selfTestTimeoutMs)) {
+    log(2, "Couldn't start the rollback timer -- a new build that hangs won't be rolled back");
+  }
 
-  uint32_t from = 0, to = 0;
+  uint32_t from = 0, to = 0, fsFor = 0;
+  bool fsBusy = false;
   String toVer;
   Preferences prefs;
   if (prefs.begin(cfg_.nvsNamespace, true)) {
@@ -488,9 +707,12 @@ bool SKLOta::begin(const SKLOtaConfig& config) {
     toVer = prefs.getString("to_ver", "");
     String r = prefs.getString("result", "");
     strncpy(lastResult_, r.c_str(), sizeof(lastResult_) - 1);
+    reportPending_ = prefs.getBool("report", false);
+    fsFor = prefs.getULong("fs_for", 0);
+    fsBusy = prefs.getBool("fs_busy", false);
     prefs.end();
   }
-  char msg[160];
+  char msg[200];
   if (to && cfg_.build == to) {
     // Booted the new build; selfTestLoop() decides whether it stays.
     if (!pendingVerify_) {
@@ -503,14 +725,22 @@ bool SKLOta::begin(const SKLOtaConfig& config) {
   } else if (to && from && cfg_.build == from) {
     snprintf(msg, sizeof(msg), "Build %lu failed self-test; rolled back", (unsigned long)to);
     saveResult(msg);
-    reportPending_ = true;
-    snprintf(msg, sizeof(msg), "Update to build %lu (%s) didn't pass its self-test -- the bootloader rolled back to build %lu",
+    snprintf(msg, sizeof(msg), "Update to build %lu (%s) didn't pass its self-test (failed, crashed or stopped responding) -- the bootloader rolled back to build %lu",
              (unsigned long)to, toVer.c_str(), (unsigned long)from);
     log(1, msg);
     clearInstallRecord();
   } else if (to) {
     clearInstallRecord();  // a different build entirely (flashed over USB)
   }
+
+  // A filesystem image waiting for this build (or one whose write was cut off)?
+  if (fsFor && fsFor == cfg_.build && cfg_.updateFilesystem) {
+    fsPending_ = true;
+    if (fsBusy) log(2, "The last filesystem update was interrupted -- it will be written again");
+  } else if (fsFor) {
+    clearFilesystemRecord();  // belongs to a build that isn't running (rolled back, or reflashed)
+  }
+
   if (pendingVerify_) setMessage(SKLOtaState::Idle, "Self-testing new build");
   if (!supported()) {
     log(2, "OTA updates unavailable: single app slot (flash once over USB with a two-slot partition table)");
@@ -529,6 +759,7 @@ void SKLOta::selfTestLoop() {
   bool healthy = selfTestFn_ ? selfTestFn_(status) : true;
 
   if (healthy && up >= cfg_.selfTestMinUptimeMs) {
+    disarmRollbackGuard();  // first, so it can't fire between here and "valid"
     esp_ota_mark_app_valid_cancel_rollback();
     pendingVerify_ = false;
     char msg[64];
@@ -536,9 +767,9 @@ void SKLOta::selfTestLoop() {
     saveResult(msg);
     clearInstallRecord();
     setMessage(SKLOtaState::Idle, msg);
-    reportPending_ = true;
-    char line[96];
-    snprintf(line, sizeof(line), "Self-test passed -- build %lu is now permanent", (unsigned long)cfg_.build);
+    char line[120];
+    snprintf(line, sizeof(line), "Self-test passed -- build %lu is now permanent%s", (unsigned long)cfg_.build,
+             fsPending_ ? "; writing its filesystem image next" : "");
     log(3, line);
     return;
   }
@@ -550,10 +781,23 @@ void SKLOta::selfTestLoop() {
     if (rollbackFn_) rollbackFn_(msg);
     esp_ota_mark_app_invalid_rollback_and_reboot();  // doesn't return when a previous build exists
     pendingVerify_ = false;                          // (nothing to go back to -- keep running)
+    disarmRollbackGuard();
   }
 }
 
 void SKLOta::loop() {
+  // A filesystem write just finished: hand the filesystem back.
+  if (fsRunning_ && !busy_) {
+    fsRunning_ = false;
+    if (filesystemFn_) filesystemFn_(false, fsOk_);
+    if (!fsOk_ && fsPending_) {
+      // Retry after 1, 2, 4 ... min, at most hourly.
+      uint32_t delayMs = 60000UL << (fsAttempts_ < 6 ? fsAttempts_ : 6);
+      if (delayMs > 3600000UL) delayMs = 3600000UL;
+      if (fsAttempts_ < 255) fsAttempts_++;
+      fsNextTryMs_ = millis() + delayMs;
+    }
+  }
   if (logSev_ >= 0) {  // deliver the update task's message on this task
     log(logSev_, logText_);
     logSev_ = -1;
@@ -561,10 +805,31 @@ void SKLOta::loop() {
   selfTestLoop();
   bool netReady = networkReadyFn_ ? networkReadyFn_() : WiFi.status() == WL_CONNECTED;
 
-  // After an update finished (or rolled back), check once right away, so a
+  // This build's filesystem image, once the build has proven itself.
+  if (fsPending_ && !fsRunning_ && !pendingVerify_ && !busy_ && !request_ && netReady && configured() &&
+      (long)(millis() - fsNextTryMs_) >= 0) {
+    if (!filesystemFn_) {
+      if (!fsHookWarned_) {
+        log(2, "This build comes with a filesystem image, but onFilesystemUpdate() isn't set -- not written");
+        fsHookWarned_ = true;
+      }
+    } else {
+      filesystemFn_(true, false);
+      fsRunning_ = true;
+      busy_ = true;
+      if (xTaskCreate(taskEntry, "skl_ota", cfg_.taskStack, (void*)(uintptr_t)3, 1, nullptr) != pdPASS) {
+        busy_ = false;  // finished (failed) -- handed back above on the next pass
+        fsOk_ = false;
+        log(1, "Couldn't start the filesystem update task (out of memory)");
+      }
+      return;
+    }
+  }
+
+  // After an install finished (or rolled back), check once right away, so a
   // server that records each device's build / result (see onRequest) hears
   // about it within a minute instead of at the next scheduled check.
-  if (reportPending_ && !busy_ && !request_ && netReady && configured()) {
+  if (reportPending_ && !busy_ && !request_ && !fsRunning_ && netReady && configured()) {
     reportPending_ = false;
     request_ = 1;
   }
@@ -581,7 +846,7 @@ void SKLOta::loop() {
     }
   }
 
-  if (request_ && !busy_) {
+  if (request_ && !busy_ && !fsRunning_) {
     uint8_t what = request_;
     request_ = 0;
     if (!configured()) {
