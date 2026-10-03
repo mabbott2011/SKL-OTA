@@ -1,0 +1,7 @@
+# Your signing key never belongs in a repo -- and neither does an example's
+# generated public key (each user makes their own).
+*.pem
+examples/*/ota_pubkey.h
+releases/
+.pio/
+tools/__pycache__/
