@@ -355,11 +355,12 @@ MINIZ_DIR=miniz test/host/run.sh path/to/firmware.bin
 
 `tools/test_ota_release.sh` runs the release tool end to end with a throwaway key: keygen, sign (firmware + filesystem image), verify, and checks that verify **rejects** a changed build number or board, a swapped signature, the wrong signing context, a modified image and a corrupted compressed copy.
 
-CI (`.github/workflows/ci.yml`) runs both on every push, compiles `examples/Basic` for an ESP32, and on a `v*` tag checks that the tag matches the version in `library.json`, `library.properties` and `SKLOta.h`.
+CI (`.github/workflows/ci.yml`) runs both on every push, compiles the examples for an ESP32, and on a `v*` tag checks that the tag matches the version in `library.json`, `library.properties` and `SKLOta.h`.
 
-## Example
+## Examples
 
-[`examples/Basic`](examples/Basic/Basic.ino) checks a manifest URL and installs when you type `update` in the Serial Monitor.
+- [`examples/Demo`](examples/Demo) — **start here.** A 20-minute walkthrough on your own desk: your PC is the update server, and you watch one ESP32 install a good update, then refuse a tampered manifest, a corrupted download and an old build, and undo a build that fails its self-test and one that hangs. Each build blinks its build number on the LED. `demo.py` makes a throwaway key, builds and signs each build, and runs the server (including `--tamper` and `--corrupt` modes).
+- [`examples/Basic`](examples/Basic/Basic.ino) — the minimum: checks a manifest URL and installs when you type `update` in the Serial Monitor.
 
 ## License
 

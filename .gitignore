@@ -2,6 +2,10 @@
 # generated public key (each user makes their own).
 *.pem
 examples/*/ota_pubkey.h
+# The demo's Wi-Fi settings and PlatformIO build folder
+examples/*/demo_settings.h
+examples/*/.pio/
+examples/*/*.ino.cpp
 releases/
 .pio/
 tools/__pycache__/
