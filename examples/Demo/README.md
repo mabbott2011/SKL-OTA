@@ -1,6 +1,6 @@
 # SKL-OTA demo: watch every safety check happen
 
-This demo runs entirely on your desk: one ESP32, your PC as the update server, and your own Wi-Fi. In about 20 minutes you'll see a good update install, then watch the device refuse or undo five bad ones:
+This demo runs entirely on your desk: one ESP32, your PC as the update server, and your own Wi-Fi. In about 20 minutes you'll see a good update install, then watch the device refuse or undo six bad ones:
 
 | # | What happens | What saves the device |
 |---|---|---|
@@ -9,9 +9,10 @@ This demo runs entirely on your desk: one ESP32, your PC as the update server, a
 | 3 | The download gets damaged in transit | The SHA-256 doesn't match, so the old build keeps running |
 | 4 | A correctly signed build that's broken | It fails its self-test, and the bootloader puts build 2 back |
 | 5 | A correctly signed build that hangs | The rollback timer fires even though `loop()` never runs |
-| 6 | Someone serves an old, validly signed build | Only newer builds install, so it's ignored |
+| 6 | A correctly signed build that crashes on boot | The crash resets the chip while the build is on probation, so the bootloader goes straight back |
+| 7 | Someone serves an old, validly signed build | Only newer builds install, so it's ignored |
 
-All four builds come from the same sketch, `Demo.ino`. Each one **blinks the LED its build number of times**, then pauses, so you can tell which one is running without a serial cable.
+All five builds come from the same sketch, `Demo.ino`. Each one **blinks the LED its build number of times**, then pauses, so you can tell which one is running without a serial cable.
 
 | Build | Behavior |
 |---|---|
@@ -19,6 +20,7 @@ All four builds come from the same sketch, `Demo.ino`. Each one **blinks the LED
 | 2 | Healthy. The "good update". |
 | 3 | Installs fine, then **fails its self-test** ("pretend the light sensor is missing"). |
 | 4 | **Hangs in `setup()`**, like a sensor driver stuck on I2C. LED stays solid on. |
+| 5 | **Crashes in `setup()`**: reads through a null pointer, so the chip panics and resets. |
 
 The timers are shortened for the demo: a new build must stay up 10 s and pass its self-test within 60 s. A real product should keep the defaults (1 min / 10 min).
 
@@ -182,7 +184,28 @@ Last update: Build 4 failed self-test; rolled back
 
 Build 4 never reached `loop()`, so the self-test never even ran. The timer started by `Ota.armRollbackGuard()` (the first line of `setup()`) restarted the device after 60 s + 30 s of grace, and a restart while the build is still on probation is all the bootloader needs to go back.
 
-## 6. Someone serves an old build
+## 6. A signed build that crashes on boot
+
+```sh
+python demo.py release 5
+```
+
+Type `update`. Build 5 installs, restarts, and crashes almost immediately:
+
+```
+=== SKL-OTA demo: build 5 (BROKEN: crashes in setup()) ===
+Reading the light sensor's calibration table...
+Guru Meditation Error: Core  1 panic'ed (LoadProhibited). Exception was unhandled.
+...
+Rebooting...
+=== SKL-OTA demo: build 2 (healthy) ===
+[OTA ERROR] Update to build 5 (demo-5) didn't pass its self-test (failed, crashed or stopped responding) -- the bootloader rolled back to build 2
+Last update: Build 5 failed self-test; rolled back
+```
+
+This is the fastest rollback of all: no timer, no self-test. Build 5 was still on probation when it crashed, and the ESP32's bootloader treats any restart of a build on probation as a failure, so the very next boot is build 2. Without SKL-OTA the Arduino core would have marked build 5 good as soon as it started, and the device would crash on every boot until someone plugged in a USB cable.
+
+## 7. Someone serves an old build
 
 ```sh
 python demo.py serve --build 1
@@ -216,7 +239,7 @@ Flash build 1 or 2 over USB again (`python demo.py flash 1`). To start the relea
 1. Run `python demo.py keygen` as above, then open `Demo.ino` (File > Examples > SKLOta > Demo, then save a copy). Copy `ota_pubkey.h` next to your copy, and create `demo_settings.h` there.
 2. Pick your board and the **Default 4MB with spiffs** partition scheme (it has the two app slots OTA needs).
 3. Flash with `#define BUILD 1` and `#define BREAK_MODE 0` at the top of the sketch.
-4. For each update, change those two lines (build 2 → `0`, build 3 → `1`, build 4 → `2`), use **Sketch > Export Compiled Binary**, and sign the result:
+4. For each update, change those two lines (build 2 → `0`, build 3 → `1`, build 4 → `2`, build 5 → `3`), use **Sketch > Export Compiled Binary**, and sign the result:
 
    ```sh
    python demo.py release 2 --bin path/to/your/copy/build/esp32.esp32.esp32/Demo.ino.bin

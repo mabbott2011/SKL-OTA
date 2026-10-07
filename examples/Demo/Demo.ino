@@ -1,12 +1,13 @@
 // SKL-OTA demo: watch every safety check happen on your own desk.
 //
-// One sketch, four builds. Each build blinks the LED its build number of
+// One sketch, five builds. Each build blinks the LED its build number of
 // times, so you can see which one is running without a serial cable:
 //
 //   build 1  healthy    flash this one over USB to start
 //   build 2  healthy    the "good update"
 //   build 3  BROKEN     installs fine, then fails its self-test -> rolled back
 //   build 4  BROKEN     hangs in setup(), loop() never runs -> rolled back by the timer
+//   build 5  BROKEN     crashes (null pointer) during setup() -> rolled back on the very next boot
 //
 // demo.py (next to this file) makes a throwaway key, builds and signs each
 // one, and runs a tiny update server on your PC that can also play the
@@ -33,13 +34,13 @@
 #endif
 
 // ---- which build this is ---------------------------------------------------------
-// PlatformIO sets both per environment (platformio.ini: build1 ... build4).
+// PlatformIO sets both per environment (platformio.ini: build1 ... build5).
 // Arduino IDE: edit them before each Sketch > Export Compiled Binary.
 #ifndef BUILD
 #define BUILD 1
 #endif
 #ifndef BREAK_MODE
-#define BREAK_MODE 0  // 0 = healthy, 1 = fails its self-test, 2 = hangs in setup()
+#define BREAK_MODE 0  // 0 = healthy, 1 = fails its self-test, 2 = hangs in setup(), 3 = crashes in setup()
 #endif
 
 // The public half of the demo key (`python demo.py keygen` writes it).
@@ -67,6 +68,7 @@ const uint32_t SELF_TEST_TIMEOUT_MS = 60UL * 1000;
 const char* modeName() {
   return BREAK_MODE == 1 ? "BROKEN: fails its self-test"
        : BREAK_MODE == 2 ? "BROKEN: hangs in setup()"
+       : BREAK_MODE == 3 ? "BROKEN: crashes in setup()"
                          : "healthy";
 }
 
@@ -119,6 +121,19 @@ void setup() {
                   (unsigned long)s, (unsigned long)(SELF_TEST_TIMEOUT_MS / 1000 + 30));
     delay(10000);
   }
+#elif BREAK_MODE == 3
+  // Pretend a driver reads through a bad pointer: the chip panics ("Guru
+  // Meditation Error") and resets. A reset while this build is still on
+  // probation is all the bootloader needs -- it boots the previous build
+  // on the very next start, without waiting for any timer.
+  if (!onProbation) {
+    Serial.println("This build wasn't installed over the air, so it will crash on every boot.");
+    Serial.println("Reflash build 1 or 2 over USB.");
+  }
+  Serial.println("Reading the light sensor's calibration table...");
+  Serial.flush();
+  volatile uint32_t* table = nullptr;
+  Serial.printf("%lu\n", (unsigned long)*table);  // LoadProhibited -> panic -> reset
 #else
   (void)onProbation;
 #endif

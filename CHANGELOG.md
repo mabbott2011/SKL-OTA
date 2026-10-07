@@ -2,7 +2,7 @@
 
 ## Unreleased
 
-- New `examples/Demo`: an end-to-end walkthrough with one sketch and four builds (healthy, healthy, fails its self-test, hangs in `setup()`), each blinking its build number. `demo.py` makes a throwaway key, builds and signs releases, and runs a small update server that can also tamper with the manifest, corrupt the download, or serve an old build. Compiled in CI.
+- New `examples/Demo`: an end-to-end walkthrough with one sketch and five builds (healthy, healthy, fails its self-test, hangs in `setup()`, crashes in `setup()`), each blinking its build number. `demo.py` makes a throwaway key, builds and signs releases, and runs a small update server that can also tamper with the manifest, corrupt the download, or serve an old build. Compiled in CI.
 
 ## 1.1.0 (2026-10-03)
 

@@ -33,7 +33,8 @@ KEY = os.path.join(HERE, "demo-key.pem")       # *.pem is git-ignored
 HEADER = os.path.join(HERE, "ota_pubkey.h")    # git-ignored for examples
 RELEASES = os.path.join(HERE, "releases")      # git-ignored
 BOARD = "skl-ota-demo"                         # must match DEMO_BOARD in Demo.ino
-WHAT = {1: "healthy", 2: "healthy", 3: "BROKEN: fails its self-test", 4: "BROKEN: hangs in setup()"}
+WHAT = {1: "healthy", 2: "healthy", 3: "BROKEN: fails its self-test", 4: "BROKEN: hangs in setup()",
+        5: "BROKEN: crashes in setup()"}
 
 
 def run(cmd):
@@ -72,7 +73,7 @@ def cmd_keygen(args):
 
 def cmd_flash(args):
     need_key()
-    if args.build in (3, 4):
+    if args.build in (3, 4, 5):
         print("Note: build {0} is meant to arrive OVER THE AIR. Flashed over USB it isn't on".format(args.build))
         print("probation, so there's no previous build to roll back to.")
     run([pio(), "run", "-e", "build{0}".format(args.build), "-t", "upload", "-t", "monitor"])
@@ -211,7 +212,7 @@ def main():
     sub = ap.add_subparsers(dest="cmd", required=True)
     sub.add_parser("keygen", help="make the throwaway demo key")
     f = sub.add_parser("flash", help="build N, upload over USB, open the Serial Monitor")
-    f.add_argument("build", type=int, choices=[1, 2, 3, 4])
+    f.add_argument("build", type=int, choices=[1, 2, 3, 4, 5])
     r = sub.add_parser("release", help="build N and sign it into releases/N/")
     r.add_argument("build", type=int)
     r.add_argument("--bin", help="an already-built .bin (Arduino IDE: Sketch > Export Compiled Binary)")
